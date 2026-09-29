@@ -1,0 +1,5 @@
+# scratch from the offline test harness (fake roots) — never committed
+tests/.work/
+
+# build scratch
+.build-*/
