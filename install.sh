@@ -15,8 +15,11 @@
 #
 # Usage:
 #   sh install.sh [--check]             # --check = read-only audit
-#   sh -c "$(wget -qO- <url>)"          # default: apply
-#   sh -c "$(wget -qO- <url>)" --check  # audit first
+#   wget -qO- <url> | sh -s             # default: apply (pipe, NOT sh -c:
+#   wget -qO- <url> | sh -s -- --check  # audit first)
+#   NOTE: this script is ~150 KB and the kernel caps a single argv entry at
+#   128 KiB, so `sh -c "$(curl …)"` fails with "Argument list too long" on
+#   the router. Always pipe via stdin.
 #
 # Test-harness env (offline only, see tests/):
 #   ROOTUP_ROOT=<dir>    operate on <dir> as the root filesystem (fake root)
@@ -25,7 +28,7 @@
 #   ROOTUP_SKIP_NFT=1    skip live nft verification
 # ============================================================================
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 ROOT="${ROOTUP_ROOT:-/}"
 TESTMODE="${ROOTUP_TEST:-0}"
 PROCFS="${ROOTUP_PROCFS:-/proc}"

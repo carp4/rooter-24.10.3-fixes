@@ -8,14 +8,14 @@
 #   3. concatenates src/*.sh + the embedded payload table into install.sh
 #
 # Usage:  build.sh           (writes ./install.sh + ./install.sh.md5)
-#         BUILD_VER=1.0.1 build.sh   (version stamp override)
+#         BUILD_VER=1.0.2 build.sh   (version stamp override)
 # ============================================================================
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-VER="${BUILD_VER:-1.0.1}"
+VER="${BUILD_VER:-1.0.2}"
 OUT="install.sh"
 CONF="metadata/fingerprints.conf"
 
@@ -55,7 +55,7 @@ trap 'rm -rf "$T"' EXIT
 OUTT="$T/install.sh"
 {
 	# header with version stamp
-	sed "s/^VERSION=\"1.0.1\"/VERSION=\"$VER\"/" src/00-header.sh
+	sed "s/^VERSION=\"1.0.2\"/VERSION=\"$VER\"/" src/00-header.sh
 	printf '\n'
 
 	# libs

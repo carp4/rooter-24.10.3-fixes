@@ -6,21 +6,28 @@ same build ecosystem (OpenWrt 24.10 / firewall4 / nftables base).
 
 ## One-liner
 
+Pipe it into `sh` — **do not** use `sh -c "$(curl …)"`. The installer is
+~150 KB and the kernel caps any single argument at 128 KiB, so the
+`sh -c` form dies with `Argument list too long` on the router. Piping via
+stdin has no such limit.
+
 ```sh
-sh -c "$(wget -qO- https://raw.githubusercontent.com/carp4/rooter-24.10.3-fixes/main/install.sh)"
+wget -qO- https://raw.githubusercontent.com/carp4/rooter-24.10.3-fixes/main/install.sh | sh -s
 ```
 
 Or with `curl`:
 
 ```sh
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/carp4/rooter-24.10.3-fixes/main/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/carp4/rooter-24.10.3-fixes/main/install.sh | sh -s
 ```
 
 Prefer to inspect first — the installer ships a read-only audit mode:
 
 ```sh
-sh -c "$(wget -qO- https://raw.githubusercontent.com/carp4/rooter-24.10.3-fixes/main/install.sh)" --check
+wget -qO- https://raw.githubusercontent.com/carp4/rooter-24.10.3-fixes/main/install.sh | sh -s -- --check
 ```
+
+Pin a release by swapping `main` for the tag (e.g. `v1.0.1`).
 
 ## What it fixes
 
