@@ -25,7 +25,7 @@
 #   ROOTUP_SKIP_NFT=1    skip live nft verification
 # ============================================================================
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 ROOT="${ROOTUP_ROOT:-/}"
 TESTMODE="${ROOTUP_TEST:-0}"
 PROCFS="${ROOTUP_PROCFS:-/proc}"
@@ -97,6 +97,38 @@ note() { printf '  [NOTE] %s\n' "$*"; }
 # has_cmd CMD  -> 0 if a command exists (respects a PATH that includes stubs)
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# ------------------------------------------------------------------ decode ----
+# b64dec — base64 decode stdin -> stdout. Pure awk, busybox-safe: ROOter 24.10
+# images have NO `base64` binary (probed live: not in PATH, not a busybox
+# applet), so GNU `base64 -d` is a hard no-go on the target. awk is
+# guaranteed (busybox). LC_ALL=C is forced so printf "%c" emits raw bytes
+# for values >= 128 (payloads are text; md5-gating still requires byte
+# exactness). Output is then md5-verified against the canonical fingerprint.
+b64dec() {
+	LC_ALL=C awk '
+		function val(c,    i) {
+			i = index("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", c)
+			return i ? i - 1 : 0
+		}
+		{
+			s = $0
+			n = length(s)
+			for (i = 1; i <= n; i += 4) {
+				c1 = substr(s, i, 1)
+				c2 = substr(s, i + 1, 1)
+				c3 = substr(s, i + 2, 1)
+				c4 = substr(s, i + 3, 1)
+				v = val(c1) * 262144 + val(c2) * 4096
+				if (c3 != "" && c3 != "=") v += val(c3) * 64
+				if (c4 != "" && c4 != "=") v += val(c4)
+				printf "%c", int(v / 65536)
+				if (c3 != "" && c3 != "=") printf "%c", int((v % 65536) / 256)
+				if (c4 != "" && c4 != "=") printf "%c", v % 256
+			}
+		}' 2>/dev/null || return 1
+	return 0
+}
+
 # ---------------------------------------------------------------- backup ----
 BK=""
 BK_FILES=""
@@ -122,7 +154,13 @@ backup_file() { # dest-path (absolute, no leading /)
 	[ -n "$BK_FILES" ] || return 0
 	rel="$(printf '%s' "$dest" | tr '/' '_')"
 	if [ -f "$(rp "$dest")" ]; then
-		cp -p "$(rp "$dest")" "$BK_FILES/$rel" 2>/dev/null || warn "backup copy failed: $dest"
+		cp -p "$(rp "$dest")" "$BK_FILES/$rel" 2>/dev/null || { warn "backup copy failed: $dest"; return 0; }
+		# manifest: backup-name<space>dest-path — the filesystem name alone is
+		# NOT reversible (underscores in filenames corrupt tr '_' '/'), so
+		# record the real destination explicitly (see write_rollback). A space
+		# delimiter is safe here (no path has spaces) and, unlike a tab via
+		# printf, survives the unquoted heredoc without backslash mangling.
+		printf '%s %s\n' "$rel" "$dest" >> "$BK/manifest"
 	fi
 }
 
@@ -132,14 +170,24 @@ write_rollback() {
 #!/bin/sh
 # Restore state captured before running roo_fix on $(date).
 # Sourced by the operator if the fixes must be reverted.
+# Set ROOT_PREFIX=<dir> to restore under <dir> instead of / (test/dry-run).
 set -e
 BK="$BK"
-for f in \$(ls "\$BK/files"); do
-  dest="\$(printf '%s' "\$f" | tr '_' '/')"
-  [ -f "\$BK/files/\$f" ] || continue
-  echo "restore: /\$dest"
-  cp -p "\$BK/files/\$f" "/\$dest"
-done
+R="\${ROOT_PREFIX:-}"
+if [ -s "\$BK/manifest" ]; then
+  while read -r rel dest || [ -n "\$rel" ]; do
+    [ -f "\$BK/files/\$rel" ] || continue
+    echo "restore: \$R/\$dest"
+    cp -p "\$BK/files/\$rel" "\$R/\$dest"
+  done < "\$BK/manifest"
+else
+  for f in \$(ls "\$BK/files"); do
+    dest="\$(printf '%s' "\$f" | tr '_' '/')"
+    [ -f "\$BK/files/\$f" ] || continue
+    echo "restore: \$R/\$dest"
+    cp -p "\$BK/files/\$f" "\$R/\$dest"
+  done
+fi
 for p in network firewall dhcp mwan3 profile; do
   [ -f "\$BK/\$p.uci" ] && { echo "uci import \$p"; uci import "\$p" < "\$BK/\$p.uci" 2>/dev/null; }
 done
@@ -285,7 +333,7 @@ payload_apply() {
 	tmpb64="$TMPD/$name.b64"
 	printf '%s' "$b64" > "$tmpb64"
 	tmp="$TMPD/$name"
-	base64 -d < "$tmpb64" > "$tmp" 2>/dev/null || { fail "$name: base64 decode failed"; return 1; }
+	b64dec < "$tmpb64" > "$tmp" 2>/dev/null || { fail "$name: payload decode failed"; return 1; }
 	payloadmd5="$(md5sum "$tmp" | cut -d' ' -f1)"
 	if [ "$payloadmd5" != "$canon" ]; then
 		fail "$name: embedded payload md5 mismatch (got $payloadmd5, want $canon) — build artifact broken"

@@ -58,7 +58,7 @@ payload_apply() {
 	tmpb64="$TMPD/$name.b64"
 	printf '%s' "$b64" > "$tmpb64"
 	tmp="$TMPD/$name"
-	base64 -d < "$tmpb64" > "$tmp" 2>/dev/null || { fail "$name: base64 decode failed"; return 1; }
+	b64dec < "$tmpb64" > "$tmp" 2>/dev/null || { fail "$name: payload decode failed"; return 1; }
 	payloadmd5="$(md5sum "$tmp" | cut -d' ' -f1)"
 	if [ "$payloadmd5" != "$canon" ]; then
 		fail "$name: embedded payload md5 mismatch (got $payloadmd5, want $canon) — build artifact broken"

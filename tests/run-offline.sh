@@ -12,10 +12,17 @@
 #   3. runs ./install.sh          -> must replace old scripts with canonical
 #   4. re-runs ./install.sh       -> idempotent (all already-current)
 #   5. runs ./install.sh on new-root -> no-op (all canonical)
+#   6. RUNS the generated rollback.sh -> must restore the pre-replace stock
+#      state, including filenames containing '_' (a reverse-mapping bug once
+#      shipped where rollback restored create_hostless.sh to
+#      .../connect/create/hostless.sh)
 #
 # Env:
 #   ROOTUP_WORK=<dir>   scratch dir for fake roots (default tests/.work)
 #   ROOTUP_SRC=<source2410 tree>, ROOTUP_FIX19=<b19 rootfs>  override paths
+#   ROOTUP_NOBASE64=1   shadow system `base64` with an exit-127 shim across
+#                       the whole suite — proves the installer never calls it
+#                       (ROOter 24.10 images ship NO base64 binary)
 #
 # Requires: ./build.sh already run (produces install.sh).
 # ============================================================================
@@ -97,9 +104,20 @@ exit 0
 STUB
 chmod +x "$WORK/uci"
 
+# optional no-base64 regime (ROOTUP_NOBASE64=1): shadow system base64 with an
+# exit-127 shim across the whole suite — the installer must never call it.
+NOB64="${ROOTUP_NOBASE64:-0}"
+if [ "$NOB64" = 1 ]; then
+	mkdir -p "$WORK/nob64"
+	printf '#!/bin/sh\necho "base64: not found" >&2\nexit 127\n' > "$WORK/nob64/base64"
+	chmod +x "$WORK/nob64/base64"
+	echo "== base64 shadowed (ROOTUP_NOBASE64=1): any base64 use will fail =="
+fi
+
 run_install() { # root-dir mode
 	r="$1"; mode="$2"
-	PATH="$WORK:$PATH" \
+	X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"
+	PATH="$X$WORK:$PATH" \
 	ROOTUP_ROOT="$r" \
 	ROOTUP_TEST=1 \
 	ROOTUP_SKIP_NFT=1 \
@@ -164,6 +182,33 @@ echo "== TEST 4: install on new (canonical) root is a no-op =="
 out="$(run_install "$WORK/new-root" apply)"
 printf '%s\n' "$out" | grep -q "already current" || { echo "FAIL: canonical root should be all-skip"; printf '%s\n' "$out"; exit 1; }
 echo "PASS: canonical root no-op"
+
+echo
+echo "== TEST 5: generated rollback.sh restores the pre-replace stock state =="
+bk="$(ls -d "$WORK/old-root/root"/rooter-upgrade-bk-* 2>/dev/null | head -1)"
+[ -n "$bk" ] || { echo "FAIL: no backup dir to roll back"; exit 1; }
+[ -s "$bk/manifest" ] || { echo "FAIL: backup dir has no manifest"; exit 1; }
+# capture the stock md5s of the old-root payloads (what rollback must restore)
+i=0
+stock_m5=""
+for f in $FILES; do
+	i=$((i+1))
+	src="$(printf '%s\n' "$SRCF" | sed -n "${i}p")"
+	sm="$(git -C "$SRC" show "HEAD:$src" 2>/dev/null | md5sum | cut -d' ' -f1)"
+	stock_m5="$stock_m5 $f=$sm"
+done
+# run the real generated rollback.sh against the fake root
+PATH="$WORK:$PATH" ROOT_PREFIX="$WORK/old-root" sh "$bk/rollback.sh" > "$WORK/rollback.log" 2>&1 || {
+	echo "FAIL: rollback.sh exited nonzero"; cat "$WORK/rollback.log"; exit 1; }
+bad=0
+for pair in $stock_m5; do
+	f="${pair%%=*}"; want="${pair#*=}"
+	[ -f "$WORK/old-root/$f" ] || { echo "  missing after rollback: $f"; bad=1; continue; }
+	got="$(md5sum "$WORK/old-root/$f" | cut -d' ' -f1)"
+	[ "$got" = "$want" ] || { echo "  not restored: $f got=$got want=$want"; bad=1; }
+done
+[ "$bad" = 1 ] && { echo "FAIL: rollback did not restore stock state"; cat "$WORK/rollback.log"; exit 1; }
+echo "PASS: rollback.sh restored all stock files (underscore names intact)"
 
 echo
 echo "== ALL OFFLINE TESTS PASSED =="
