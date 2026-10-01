@@ -8,16 +8,25 @@
 #   3. concatenates src/*.sh + the embedded payload table into install.sh
 #
 # Usage:  build.sh           (writes ./install.sh + ./install.sh.md5)
-#         BUILD_VER=1.1.0 build.sh   (version stamp override)
+#         BUILD_VER=1.1.3 build.sh   (version stamp override)
 # ============================================================================
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
-VER="${BUILD_VER:-1.1.0}"
 OUT="install.sh"
 CONF="metadata/fingerprints.conf"
+
+# src/00-header.sh is the SINGLE source of truth for the version. This used to
+# be the other way round: VER defaulted to a literal 1.1.0 and the stamp was a
+# sed against that same literal. Bumping the version the natural way (editing
+# the header) therefore silently no-op'd the stamp while the build went on
+# REPORTING 1.1.0 for an artifact that was actually something else. A build
+# that misreports its own version cannot be trusted to report anything.
+VER="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' src/00-header.sh | head -1)"
+[ -n "$VER" ] || { echo "build.sh: no VERSION= found in src/00-header.sh" >&2; exit 1; }
+[ -n "${BUILD_VER:-}" ] && VER="$BUILD_VER"
 
 [ -f "$CONF" ] || { echo "build.sh: missing $CONF" >&2; exit 1; }
 
@@ -54,8 +63,9 @@ trap 'rm -rf "$T"' EXIT
 
 OUTT="$T/install.sh"
 {
-	# header with version stamp
-	sed "s/^VERSION=\"1.1.0\"/VERSION=\"$VER\"/" src/00-header.sh
+	# header with version stamp (matches whatever the header currently says,
+	# not a hardcoded literal)
+	sed "s/^VERSION=\".*\"$/VERSION=\"$VER\"/" src/00-header.sh
 	printf '\n'
 
 	# libs
@@ -86,6 +96,14 @@ OUTT="$T/install.sh"
 # the \"\\\n continuation trick must not leak a trailing backslash into the
 # final line+quote; verify the assignment parses as one logical line
 sh -n "$OUTT" || { echo "build.sh: generated script fails sh -n" >&2; exit 1; }
+
+# The version in the artifact must be the version being reported. This is the
+# check that would have caught the 1.1.0/actual mismatch above.
+got_ver="$(sed -n 's/^VERSION="\(.*\)"$/\1/p' "$OUTT" | head -1)"
+[ "$got_ver" = "$VER" ] || {
+	echo "build.sh: version stamp mismatch (reporting $VER, artifact says '${got_ver:-<none>}')" >&2
+	exit 1
+}
 
 cp "$OUTT" "$OUT"
 md5sum "$OUT" | cut -d' ' -f1 > "$OUT.md5"

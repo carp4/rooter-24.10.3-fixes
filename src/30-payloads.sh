@@ -51,6 +51,13 @@ payload_apply() {
 
 	if [ "$onbox" = "$canon" ]; then
 		ok "$name: already current (skip)"
+		# No activation flag here, deliberately. The running tracker process
+		# could in principle predate the on-disk file, but that is
+		# unfalsifiable from outside the process, so flagging it would mean
+		# EVERY run restarts mwan3 and the gate stops discriminating. The
+		# contract roo_fix can actually keep is "if I changed it, I activate
+		# it" -- a box that already carries the canonical bytes has nothing
+		# outstanding from us.
 		return 0
 	fi
 
@@ -76,6 +83,12 @@ payload_apply() {
 	IFS="$OLDIFS"
 
 	if [ "$match" = 1 ]; then
+		# Per-payload activation signal, set in BOTH modes so --check reports
+		# the restart that applying would cause. CHANGED is only a counter, so
+		# fix_ipv6 cannot otherwise learn the tracker was replaced -- and a
+		# replaced tracker on disk is inert until the process respawns.
+		# Conditioned on $name so a payload swap never bounces mwan3 by accident.
+		[ "$name" = "mwan3track" ] && MWAN3TRACK_REPLACED=1
 		if [ "$MODE" = "check" ]; then
 			note "$name: would replace (onbox $onbox -> canonical)"
 			return 0

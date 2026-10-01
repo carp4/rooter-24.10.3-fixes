@@ -39,25 +39,33 @@ FIX19="${ROOTUP_FIX19:-../../flash-staging/b19/rootfs}"
 [ -d "$SRC/.git" ] || { echo "source2410 git tree missing: $SRC" >&2; exit 1; }
 [ -d "$FIX19" ] || { echo "b19 rootfs fixture missing: $FIX19" >&2; exit 1; }
 
-# the 6 payload destinations (relative paths)
+# the 7 payload destinations (relative paths)
 FILES="usr/lib/rooter/connect/create_hostless.sh
 usr/lib/rooter/connect/handlettl.sh
 usr/lib/rooter/connect/get_profile.sh
 usr/lib/lua/luci/model/cbi/rooter/profiles.lua
 usr/lib/rooter/luci/restartrun.sh
-usr/libexec/luci-mwan3"
+usr/libexec/luci-mwan3
+usr/sbin/mwan3track"
 
 # where the STOCK (pre-fix) bytes come from, index-aligned with FILES.
 # Either a path inside the source2410 git tree (extracted from git HEAD), or
-# "file:<path>" for a checked-in fixture. luci-mwan3 needs the fixture form:
-# its fix is patched into the luci feed at HEAD, so git HEAD is no longer the
-# stock version we need in order to model a pre-fix box.
+# "file:<path>" for a checked-in fixture.
+#
+# luci-mwan3 and mwan3track need the fixture form: their fixes are patched
+# into the tree, so git HEAD is no longer the stock version we need in order to
+# model a pre-fix box. For mwan3track this is also the only form that stays
+# correct once the tree change is committed -- sourcing "stock" from HEAD
+# would then return the PATCHED bytes and the pre-fix box could no longer be
+# modelled at all. Fixtures are captured from origin/main (the vendor tip),
+# so they never drift with our commits.
 SRCF="package/rooter/ext-rooter-basic/files/usr/lib/rooter/connect/create_hostless.sh
 package/rooter/ext-rooter-basic/files/usr/lib/rooter/connect/handlettl.sh
 package/rooter/ext-rooter-basic/files/usr/lib/rooter/connect/get_profile.sh
 package/rooter/ext-rooter-basic/files/usr/lib/lua/luci/model/cbi/rooter/profiles.lua
 package/rooter/ext-rooter-basic/files/usr/lib/rooter/luci/restartrun.sh
-file:fixtures/stock/luci-mwan3"
+file:fixtures/stock/luci-mwan3
+file:fixtures/stock/mwan3track"
 
 CONF="$HERE/../metadata/fingerprints.conf"
 
@@ -121,6 +129,17 @@ done
 # PATH by run_install so it shadows any real uci. Consequence: the installer
 # uses `uci -q commit` etc., which the stub no-ops (exit 0), so uci-driven
 # config is exercised but never persisted — file fingerprints are asserted.
+#
+# The mwan3 half of this stub is deliberately NOT a single hardcoded list.
+# The number of wan<N> / wan<N>_6 members depends on the box's "Multiple
+# Modems" setting, so a real box may have a different count than any fixture.
+# The stub emits a configurable set (MWAN3_STUB_FILE, default below) to prove
+# the installer DISCOVERS members rather than assuming a fixed set.
+#
+# IMPORTANT: values are emitted QUOTED, exactly like real `uci show`
+# (mwan3.wan1_6.family='ipv6'). A fixture that omitted the quotes would let a
+# broken regex such as /family=ipv6$/ pass here and then match nothing on the
+# router, which is exactly the class of silent no-op these tests exist to catch.
 cat > "$WORK/uci" <<'STUB'
 #!/bin/sh
 # Minimal uci stub for offline tests. Answer just enough for env_probe + fixes:
@@ -129,18 +148,96 @@ cat > "$WORK/uci" <<'STUB'
 #   network.wan6.proto -> dhcpv6 ; network.lan show -> ok (empty)
 #   profile.default.preserve -> 1 ; everything else -> "" (exit 0)
 case "$*" in
-	*modem.modem1.connected*) echo 1 ;;
-	*modem.modem1.interface*) echo usb0 ;;
-	*firewall.@zone\[0\].name*) echo wan ;;
-	*network.wan6.proto*) echo dhcpv6 ;;
-	*network.wan1_6.proto*) echo dhcpv6 ;;
-	*network.lan*proto*) echo static ;;
-	*profile.default.preserve*) echo 1 ;;
-	*) echo "" ;;
+	*modem.modem1.connected*) echo 1; exit 0 ;;
+	*modem.modem1.interface*) echo usb0; exit 0 ;;
+	*firewall.@zone\[0\].name*) echo wan; exit 0 ;;
+	*network.wan6.proto*) echo dhcpv6; exit 0 ;;
+	*network.wan1_6.proto*) echo dhcpv6; exit 0 ;;
+	*network.lan*proto*) echo static; exit 0 ;;
+	*profile.default.preserve*) echo 1; exit 0 ;;
 esac
+
+# --- mwan3 ---------------------------------------------------------------
+# Model file: one record per line, TAB-separated:
+#   <section-name>  <type>  <family>  <track_ips>  <flush_conntrack>
+# Blank <family> means the option is absent. Empty list fields are allowed.
+MF="${MWAN3_STUB_FILE:-/mwan3.model}"
+
+# Normalise argv BEFORE dispatching. uciq() is `uci -q "$@"`, so the
+# subcommand is NOT $1 — it is $2. Keying on $1 makes every branch
+# unreachable and the stub silently answers "", which looks exactly like an
+# empty mwan3 config and turns a working installer into a no-op.
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-*) shift ;;
+		*) break ;;
+	esac
+done
+
+# `uci show mwan3` -> one line per option, values quoted like the real tool
+if [ "$1" = "show" ] && [ "$2" = "mwan3" ]; then
+	[ -f "$MF" ] || exit 0
+	while IFS='	' read -r nm tp fam trk fl; do
+		[ -n "$nm" ] || continue
+		case "$nm" in \#*) continue ;; esac
+		echo "mwan3.$nm=$tp"
+		[ -n "$fam" ] && echo "mwan3.$nm.family='$fam'"
+		[ -n "$trk" ] && for v in $trk; do echo "mwan3.$nm.track_ip='$v'"; done
+		[ -n "$fl" ]  && for v in $fl;  do echo "mwan3.$nm.flush_conntrack='$v'"; done
+	done < "$MF"
+	exit 0
+fi
+
+# `uci get mwan3.<sec>.<opt>` and `uci get mwan3.<sec>`
+# Section lookup is a plain string compare, not a grep pattern: real section
+# names may contain regex metacharacters, and an unescaped match would either
+# miss a member or hit the wrong one.
+if [ "$1" = "get" ]; then
+	key="$2"
+	case "$key" in
+		mwan3.*) ;;
+		*) echo ""; exit 0 ;;
+	esac
+	sec="${key#mwan3.}"; sec="${sec%%.*}"; opt=""
+	case "$key" in *.*) opt="${key##*.}" ;; esac
+	[ -f "$MF" ] || exit 0
+	fam=""; trk=""; fl=""; tp=""
+	# No pipe: `done < file` keeps these assignments in this shell, which a
+	# `... | while read` would not.
+	while IFS='	' read -r nm t f t2 f2; do
+		[ "$nm" = "$sec" ] || continue
+		tp="$t"; fam="$f"; trk="$t2"; fl="$f2"
+		break
+	done < "$MF"
+	case "$opt" in
+		"") echo "$tp" ;;
+		family) echo "$fam" ;;
+		track_ip) echo "$trk" ;;
+		flush_conntrack) echo "$fl" ;;
+		enabled) echo 1 ;;
+		*) echo "" ;;
+	esac
+	exit 0
+fi
+
+echo ""
 exit 0
 STUB
 chmod +x "$WORK/uci"
+
+# Default mwan3 model. Deliberately includes:
+#   - ipv4 and ipv6 members, so family filtering is actually exercised
+#   - a hostname track_ip on some members, so fix_mwan3_numeric has work to do
+#   - a `rule` section with family ipv6 (rule_v6), which must NOT be touched
+#   - a mix of already-correct and stock-churn flush lists
+cat > "$WORK/mwan3.model" <<'MODEL'
+wan1	interface	ipv4	www.google.com www.facebook.com	connected disconnected ifup ifdown
+wan1_6	interface	ipv6	ipv6.google.com www.v6.facebook.com	connected disconnected ifup ifdown
+wan2	interface	ipv4	8.8.8.8	connected disconnected ifup ifdown
+wan2_6	interface	ipv6	2606:4700::1001 2001:4860:4860::8888	connected disconnected ifup ifdown
+wan6	interface	ipv6	2606:4700::1001 2620:fe::9	ifup ifdown
+rule_v6	rule	ipv6			connected disconnected
+MODEL
 
 # optional no-base64 regime (ROOTUP_NOBASE64=1): shadow system base64 with an
 # exit-127 shim across the whole suite — the installer must never call it.
@@ -159,7 +256,9 @@ run_install() { # root-dir mode
 	ROOTUP_ROOT="$r" \
 	ROOTUP_TEST=1 \
 	ROOTUP_SKIP_NFT=1 \
+	ROOTUP_DEBUG="${ROOTUP_DEBUG:-0}" \
 	ROOTUP_PROCFS="/proc" \
+	MWAN3_STUB_FILE="$WORK/mwan3.model" \
 	sh ../install.sh "$mode"
 }
 
@@ -410,6 +509,261 @@ case "$s4" in
 	*) echo "FAIL: stock IPv4 path unexpectedly broken: $s4"; exit 1 ;;
 esac
 echo "PASS: TEST 7 is discriminating (stock fails IPv6, passes IPv4)"
+
+echo
+echo "== TEST 8: mwan3track fix — recovers a stale ipv6 source pin =="
+# Extract-and-run: exercise the SHIPPED tracker's own recovery logic rather
+# than a rewrite of it, so the test tracks the shipped bytes.
+extract_fn() { # file fn -> prints the function body
+	awk -v want="$2" '
+		$0 ~ "^" want "[ \t]*\\(\\) *\\{" { inb=1 }
+		inb { print }
+		inb && /^\}/ { exit }
+	' "$1"
+}
+pay=../payloads/mwan3track
+stk=fixtures/stock/mwan3track
+[ -f "$pay" ] || { echo "FAIL: payload mwan3track missing"; exit 1; }
+sh -n "$pay" || { echo "FAIL: payload is not valid POSIX sh"; exit 1; }
+# the patch must re-derive a source that no longer exists on the device
+grep -q 'refresh_src_ip' "$pay" || { echo "FAIL: payload has no refresh_src_ip"; exit 1; }
+# and the stock file must NOT have it, else there is no bug to fix
+if grep -q 'refresh_src_ip' "$stk" 2>/dev/null; then
+	echo "FAIL: stock fixture already re-derives its source — fixture drifted"; exit 1
+fi
+# stock must be gated as known-old, else a stock box would be REPORT-ONLY
+row="$(awk -F'|' '$1=="mwan3track" {print $5}' "$CONF")"
+stk_m5="$(md5sum "$stk" | cut -d' ' -f1)"
+pay_m5="$(md5sum "$pay" | cut -d' ' -f1)"
+case ",$row," in
+	*",$stk_m5,"*) ;;
+	*) echo "FAIL: stock md5 $stk_m5 not in known-old set ($row)"; exit 1 ;;
+esac
+[ "$pay_m5" = "$(awk -F'|' '$1=="mwan3track" {print $4}' "$CONF")" ] \
+	|| { echo "FAIL: payload md5 does not match the canonical fingerprint"; exit 1; }
+
+# End-to-end: drive the SHIPPED tracker's own recovery logic with a stale pin
+# and require it to land on the address the device actually has. This mirrors
+# how the fix was proven on the box: the stale source fails to bind, the
+# re-derived one succeeds.
+#
+# Only refresh_src_ip is extracted and run. Sourcing the whole tracker would
+# execute its main tracking loop; the variables the function reads are set
+# explicitly instead. Network probes are stubbed, so the test is hermetic and
+# the assertion is purely about candidate selection.
+{ extract_fn "$pay" refresh_src_ip; } > "$WORK/fn-refresh.sh"
+if [ ! -s "$WORK/fn-refresh.sh" ]; then
+	echo "FAIL: could not extract refresh_src_ip from the payload"; exit 1
+fi
+LIVE_ADDR=2600:1006:b130:129d:4c88:1aff:fe8c:5e11
+STALE_ADDR=2600:1006:dead:beef:4c88:1aff:fe8c:5e11
+cat > "$WORK/run-pin.sh" <<RUNPIN
+#!/bin/sh
+DEVICE=usb1
+FAMILY=ipv6
+PING="ping"
+SRC_IP="$STALE_ADDR"
+probe_ip="2606:4700::1001"
+LOG() { echo "LOG: \$*" >&2; }
+. "\$1"
+refresh_src_ip
+printf '%s' "\$SRC_IP"
+RUNPIN
+
+# Stubbed probes. `ip -6 addr` lists ONLY the live address, so a withdrawn
+# address cannot pass the candidate probe — exactly the on-box failure
+# ("failed to bind to ip address: Address not available"). ping succeeds only
+# for the live source.
+mkdir -p "$WORK/pinbin"
+cat > "$WORK/pinbin/ip" <<IPSTUB
+#!/bin/sh
+case "\$1" in
+	-6) shift ;;
+esac
+case "\$1" in
+	addr)  echo "    inet6 $LIVE_ADDR/64 scope global" ;;
+	route) echo "2606:4700::1001 via fe80::1 dev usb1" ;;
+	get)   echo "2606:4700::1001 from $LIVE_ADDR dev usb1" ;;
+esac
+exit 0
+IPSTUB
+cat > "$WORK/pinbin/ping" <<PGSTUB
+#!/bin/sh
+src=""
+while [ \$# -gt 0 ]; do
+	case "\$1" in
+		-I) src="\$2"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+[ "\$src" = "$LIVE_ADDR" ] && exit 0
+exit 1
+PGSTUB
+chmod +x "$WORK/pinbin/ip" "$WORK/pinbin/ping"
+
+got="$(PATH="$WORK/pinbin:$PATH" sh "$WORK/run-pin.sh" "$WORK/fn-refresh.sh" 2>/dev/null)"
+[ "$got" = "$LIVE_ADDR" ] \
+	|| { echo "FAIL: patched tracker did not recover the stale pin (got '$got')"; exit 1; }
+
+# Discriminating check: the stock file must FAIL this same harness. If it ever
+# passed, the test would no longer be evidence of anything.
+if grep -q 'refresh_src_ip' "$stk" 2>/dev/null; then
+	echo "FAIL: stock file has refresh_src_ip — TEST 8 is vacuous"; exit 1
+fi
+echo "PASS: patched tracker re-derives a stale ipv6 source; stock has no such logic"
+
+# New assertion for v2.2: warn log when no ipv6 globals on device.
+# The v2.2 patch adds a LOG warn when candidate list is empty (withdrawal case).
+grep -q 'no ipv6 globals on device' "$pay" \
+	|| { echo "FAIL: v2.2 payload missing 'no ipv6 globals on device' warn"; exit 1; }
+# stock must NOT have it
+if grep -q 'no ipv6 globals on device' "$stk" 2>/dev/null; then
+	echo "FAIL: stock fixture already has warn — fixture drifted"; exit 1
+fi
+echo "PASS: v2.2 payload logs warn on zero-candidate withdrawal; stock has none"
+
+echo
+echo "== TEST 9: mwan3 enumeration is by name, and excludes non-interfaces =="
+# The previous fix_mwan3_numeric enumerated mwan3.@interface[$i] and found
+# ZERO members on a real box, because every mwan3 interface is a NAMED
+# section. That made the "numeric track targets" fix a silent no-op. These
+# assertions fail if the regression returns.
+out="$(run_install "$WORK/new-root" --check 2>&1)"
+# rule_v6 is family=ipv6 but type=rule: it must never be reported as a member
+if printf '%s\n' "$out" | grep -q "mwan3 interface 'rule_v6'"; then
+	echo "FAIL: rule_v6 (a policy rule) was treated as an interface"; printf '%s\n' "$out"; exit 1
+fi
+# the ipv6 members that DO need the flush fix must be reported
+for want in wan1_6 wan2_6; do
+	printf '%s\n' "$out" | grep -q "mwan3 interface '$want': flush_conntrack" \
+		|| { echo "FAIL: $want not reported by the v6 flush fix"; printf '%s\n' "$out"; exit 1; }
+done
+# wan6 is already correct in the model: it must NOT be rewritten (idempotency)
+printf '%s\n' "$out" | grep -q "mwan3 interface 'wan6': flush_conntrack" \
+	&& { echo "FAIL: already-correct wan6 would be rewritten"; printf '%s\n' "$out"; exit 1; }
+# ipv4 members must be left alone entirely
+for v4 in wan1 wan2; do
+	printf '%s\n' "$out" | grep -q "mwan3 interface '$v4': flush_conntrack" \
+		&& { echo "FAIL: ipv4 member $v4 was touched by the v6 flush fix"; exit 1; }
+done
+# hostname track_ips must be reported (proves named enumeration works at all)
+for hn in wan1 wan1_6; do
+	printf '%s\n' "$out" | grep -q "mwan3 interface '$hn': replace hostname track_ip" \
+		|| { echo "FAIL: $hn hostname track_ip not detected — enumeration is broken"; printf '%s\n' "$out"; exit 1; }
+done
+echo "PASS: members discovered by name; rule_v6 excluded; ipv4 untouched; idempotent"
+
+echo
+echo "== TEST 10: mwan3 activation is gated on an actual change =="
+# Replacing the tracker on disk is inert until the process respawns, so the
+# installer must signal activation — but only when it really changed something.
+# A no-op run must NOT claim it will restart mwan3.
+#
+# Two distinct contracts, both asserted:
+#   --check  announces INTENT ("would restart"), never executes
+#   (apply)  actually executes the restart, and only then
+# Collapsing these into one would either hide the interruption from the
+# operator or make --check lie about doing something it must not do.
+newout="$(run_install "$WORK/new-root" --check 2>&1)"
+
+# Build a model where nothing needs changing, and require no restart intent.
+cat > "$WORK/mwan3.clean" <<'CLEAN'
+wan1	interface	ipv4	1.1.1.1 8.8.8.8 9.9.9.9	connected disconnected ifup ifdown
+wan1_6	interface	ipv6	2606:4700::1001 2001:4860:4860::8888 2620:fe::9	ifup ifdown
+CLEAN
+run_with_model() { # model-file mode debug -> output
+	m="$1"; md="$2"; dbg="${3:-0}"
+	X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"
+	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" ROOTUP_DEBUG="$dbg" \
+	MWAN3_STUB_FILE="$m" sh ../install.sh "$md" 2>&1
+}
+cleanout="$(run_with_model "$WORK/mwan3.clean" --check)"
+
+# (a) clean config, check mode: must say nothing about restarting mwan3.
+# Scoped to "mwan3:" because the summary always mentions restartrun.sh (the
+# payload, not the service) — matching bare "restart" here would fail on
+# unrelated output and hide a real regression behind a false positive.
+if printf '%s\n' "$cleanout" | grep -qi 'mwan3:.*restart'; then
+	echo "FAIL: clean config would announce an mwan3 restart"; printf '%s\n' "$cleanout"; exit 1
+fi
+
+# (b) dirty config, check mode: must announce INTENT, and say "would"
+printf '%s\n' "$newout" | grep -qi 'would restart so the tracker' \
+	|| { echo "FAIL: --check did not announce the pending restart"; printf '%s\n' "$newout"; exit 1; }
+# it must not claim it is doing the restart
+printf '%s\n' "$newout" | grep -qi 'restarting so the tracker' \
+	&& { echo "FAIL: --check claims to be restarting mwan3 (read-only mode)"; printf '%s\n' "$newout"; exit 1; }
+
+# (c) dirty config, apply mode: must ACTUALLY invoke the restart.
+# ROOTUP_TEST sets TESTMODE=1, so svc() logs "svc(skip) mwan3 reload" at debug
+# level instead of touching init.d — which is exactly the evidence needed.
+applyout="$(run_with_model "$WORK/mwan3.model" apply 1)"
+printf '%s\n' "$applyout" | grep -q 'svc(skip) mwan3 reload' \
+	|| { echo "FAIL: apply did not restart mwan3 after changing it"; printf '%s\n' "$applyout"; exit 1; }
+
+# (d) clean config, apply mode: must NOT restart mwan3
+cleanapply="$(run_with_model "$WORK/mwan3.clean" apply 1)"
+printf '%s\n' "$cleanapply" | grep -q 'svc(skip) mwan3 reload' \
+	&& { echo "FAIL: apply restarted mwan3 with nothing to change"; printf '%s\n' "$cleanapply"; exit 1; }
+echo "PASS: intent reported in --check, executed only in apply, both gated on a real change"
+
+echo
+echo "== TEST 11: member discovery adapts to the member count =="
+# The number of wan<N>_6 members depends on the box's "Multiple Modems"
+# setting, so it is not fixed. A 4-member box must work exactly as well as the
+# 6-member default model, with no hardcoded names anywhere.
+cat > "$WORK/mwan3.four" <<'FOUR'
+wan1	interface	ipv4	1.1.1.1 8.8.8.8	connected disconnected ifup ifdown
+wan1_6	interface	ipv6	ipv6.google.com	connected disconnected ifup ifdown
+wan3	interface	ipv4	1.1.1.1 8.8.8.8	connected disconnected ifup ifdown
+wan3_6	interface	ipv6	ipv6.google.com	connected disconnected ifup ifdown
+FOUR
+fourout="$(X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"; \
+	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+	MWAN3_STUB_FILE="$WORK/mwan3.four" sh ../install.sh --check 2>&1)"
+for want in wan1_6 wan3_6; do
+	printf '%s\n' "$fourout" | grep -q "mwan3 interface '$want': flush_conntrack" \
+		|| { echo "FAIL: $want missed — discovery is not count-agnostic"; printf '%s\n' "$fourout"; exit 1; }
+done
+# and the count must not be pinned anywhere in the source
+if grep -nE "wan5_6|wwan26|wwan56" src/40-fix-ipv6.sh 2>/dev/null; then
+	echo "FAIL: a specific member name is hardcoded in the fix"; exit 1
+fi
+echo "PASS: discovery follows the box's member set, nothing hardcoded"
+
+echo
+echo "== TEST 12: the v6 flush fix removes churn, it never adds flushing =="
+# The defect is connected/disconnected firing on tracker churn; removing them
+# is the fix. Forcing 'ifup ifdown' onto a member that never had a
+# flush_conntrack list would ADD conntrack flushing nobody asked for -- a
+# behaviour change disguised as a repair. Same trap for a member trimmed down
+# to the churn events alone: the honest result is no list, not the two
+# link-transition events invented back.
+cat > "$WORK/mwan3.edge" <<'EDGE'
+wan1	interface	ipv4	1.1.1.1	connected disconnected ifup ifdown
+wan1_6	interface	ipv6	2606:4700::1001	connected disconnected ifup ifdown
+wan2_6	interface	ipv6	2606:4700::1001
+wan3_6	interface	ipv6	2606:4700::1001	connected disconnected
+EDGE
+edgeout="$(X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"; \
+	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+	MWAN3_STUB_FILE="$WORK/mwan3.edge" sh ../install.sh --check 2>&1)"
+
+# stock shape: churn removed, the link transitions it already had are kept
+printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan1_6': flush_conntrack .*-> 'ifup ifdown'" \
+	|| { echo "FAIL: stock-shaped wan1_6 not reduced to 'ifup ifdown'"; printf '%s\n' "$edgeout"; exit 1; }
+# churn only: churn removed, nothing invented to replace it
+printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan3_6': flush_conntrack .*-> '<none>'" \
+	|| { echo "FAIL: churn-only wan3_6 should end with no list, not 'ifup ifdown'"; printf '%s\n' "$edgeout"; exit 1; }
+# no list at all: nothing to remove, so nothing may be written
+if printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan2_6'"; then
+	echo "FAIL: wan2_6 (no flush_conntrack) was modified -- flushing was invented"
+	printf '%s\n' "$edgeout"; exit 1
+fi
+echo "PASS: churn removed; ifup/ifdown preserved and never added; churn-only ends empty"
 
 echo
 echo "== ALL OFFLINE TESTS PASSED =="

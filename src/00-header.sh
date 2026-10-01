@@ -5,13 +5,22 @@
 # Applies four generic fixes to ROOter 24.10 boxes built from the same
 # ./build ecosystem (the routers listed in router2410.json):
 #   1. IPv6 end-to-end  (firewall _6 members + masq6, lan ip6*, wan6 PD,
-#                        odhcpd RA, mwan3 numeric tracking)
+#                        odhcpd RA, mwan3 numeric tracking, mwan3 v6
+#                        conntrack-flush removal)
 #   2. TTL/HL nft fix   (handlettl.sh broken nft syntax on fw4 builds)
 #   3. Preserve fix     (skip AT writes / hard reset when the modem already
 #                        owns the session; UI toggle for it)
 #   4. mwan3 diag fix   (luci-mwan3 reported phantom "missing rule / table"
 #                        for wan<N>_6 by always using IPv4-only ip commands;
 #                        diagnostic-only, no routing behaviour change)
+#   5. mwan3track fix   (tracker pinned one ipv6 source address while the
+#                        carrier rotates the delegated /64, so every track
+#                        target failed with "Address not available"; the
+#                        patched tracker re-derives its source in place)
+#
+# 1 and 5 both require ACTIVATION: mwan3 is restarted (its reload_service is
+# { stop; start; }, which does respawn trackers) when, and only when, this run
+# actually changed mwan3 config or replaced the tracker binary.
 #
 # Self-contained: payloads are embedded base64 at build time by build.sh.
 # POSIX sh / busybox-compatible — runs on the router itself.
@@ -31,7 +40,7 @@
 #   ROOTUP_SKIP_NFT=1    skip live nft verification
 # ============================================================================
 
-VERSION="1.1.0"
+VERSION="1.1.3"
 ROOT="${ROOTUP_ROOT:-/}"
 TESTMODE="${ROOTUP_TEST:-0}"
 PROCFS="${ROOTUP_PROCFS:-/proc}"
