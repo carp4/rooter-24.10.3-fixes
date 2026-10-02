@@ -131,10 +131,16 @@ done
 # config is exercised but never persisted — file fingerprints are asserted.
 #
 # The mwan3 half of this stub is deliberately NOT a single hardcoded list.
-# The number of wan<N> / wan<N>_6 members depends on the box's "Multiple
-# Modems" setting, so a real box may have a different count than any fixture.
-# The stub emits a configurable set (MWAN3_STUB_FILE, default below) to prove
-# the installer DISCOVERS members rather than assuming a fixed set.
+# The stub emits a configurable set (MWAN3_STUB_FILE) so the installer's member
+# DISCOVERY is exercised rather than assumed. TEST 18 feeds it the real shipped
+# /etc/config/mwan3 (22 members); TEST 11 varies the count.
+#
+# Note that member count is NOT a function of the box's "Multiple Modems"
+# setting. /etc/config/mwan3 is a static file shipped in the image with all five
+# modem slots declared, while /etc/config/network is generated at first boot by
+# config_generate and IS sized by maxmodem. Measured on the reference box:
+# maxmodem=4 with one populated modem still carried all 22 mwan3 members,
+# including wan5_6 for a slot its network config has no interface for.
 #
 # IMPORTANT: values are emitted QUOTED, exactly like real `uci show`
 # (mwan3.wan1_6.family='ipv6'). A fixture that omitted the quotes would let a
@@ -764,6 +770,204 @@ if printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan2_6'"; then
 	printf '%s\n' "$edgeout"; exit 1
 fi
 echo "PASS: churn removed; ifup/ifdown preserved and never added; churn-only ends empty"
+
+echo
+echo "== TEST 13: withdrawal hotplug is CREATED when the box has none =="
+# This is the stock-flash case. ROOter ships no /etc/hotplug.d/iface/50-*
+# in either flavour, so on a freshly flashed box the destination is ABSENT.
+# Before the install-if-missing flag that hit "not present, nothing to do"
+# and the withdrawal recovery silently never arrived.
+HP=etc/hotplug.d/iface/50-z8102-wan6-mwan3
+HP_CANON="$(md5sum ../payloads/50-z8102-wan6-mwan3 | cut -d' ' -f1)"
+rm -rf "$WORK/bare-root"; mkdir -p "$WORK/bare-root/etc"
+printf 'DISTRIB_RELEASE="24.10.3"\n' > "$WORK/bare-root/etc/openwrt_release"
+# Guard: the whole point is ABSENCE. If a previous run left the file behind,
+# this would silently become the "already current" case and prove nothing.
+[ -e "$WORK/bare-root/$HP" ] && { echo "FAIL: TEST 13 setup error — hotplug already present, test would be vacuous"; exit 1; }
+
+hpout="$(X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"; \
+	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/bare-root" ROOTUP_TEST=1 \
+	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+	MWAN3_STUB_FILE="$WORK/mwan3.model" sh ../install.sh --check 2>&1)"
+printf '%s\n' "$hpout" | grep -q "50-z8102-wan6-mwan3: would install (not present on box)" \
+	|| { echo "FAIL: --check did not offer to install the missing hotplug"; printf '%s\n' "$hpout"; exit 1; }
+
+run_install "$WORK/bare-root" apply > "$WORK/run13.log" 2>&1 || { echo "FAIL: install exited nonzero"; cat "$WORK/run13.log"; exit 1; }
+[ -f "$WORK/bare-root/$HP" ] || { echo "FAIL: hotplug was not created"; exit 1; }
+got_hp="$(md5sum "$WORK/bare-root/$HP" | cut -d' ' -f1)"
+[ "$got_hp" = "$HP_CANON" ] || { echo "FAIL: hotplug md5 $got_hp != canonical $HP_CANON"; exit 1; }
+perm="$(stat -c '%a' "$WORK/bare-root/$HP" 2>/dev/null || echo '?')"
+[ "$perm" = "755" ] || { echo "FAIL: hotplug mode is $perm, want 755 (hotplug must be executable)"; exit 1; }
+# creating a file must not be reported as a replacement
+if printf '%s\n' "$hpout" | grep -q "50-z8102-wan6-mwan3: would replace"; then
+	echo "FAIL: reported as replace, but the box had no such file"; exit 1
+fi
+echo "PASS: absent hotplug created, canonical bytes, mode 755"
+
+echo
+echo "== TEST 14: hotplug already canonical is skipped =="
+out14="$(run_install "$WORK/bare-root" --check 2>&1)"
+printf '%s\n' "$out14" | grep -q "50-z8102-wan6-mwan3: already current (skip)" \
+	|| { echo "FAIL: canonical hotplug not reported as already current"; printf '%s\n' "$out14"; exit 1; }
+run_install "$WORK/bare-root" apply > "$WORK/run14.log" 2>&1 || { echo "FAIL: install exited nonzero"; exit 1; }
+[ "$(md5sum "$WORK/bare-root/$HP" | cut -d' ' -f1)" = "$HP_CANON" ] \
+	|| { echo "FAIL: canonical hotplug was altered by a re-run"; exit 1; }
+echo "PASS: canonical hotplug skipped, re-run is a no-op"
+
+echo
+echo "== TEST 15: hotplug replaces each known-old fingerprint =="
+# r10 (103 lines) and r9 (47 lines) are our own earlier revisions of this file,
+# taken from git rather than a stale build directory. A box carrying either
+# has a real defect and must be repaired.
+i=15; ran15=0
+for tag in r10 r9; do
+	rm -rf "$WORK/oldhp-root"; mkdir -p "$WORK/oldhp-root/$(dirname "$HP")" "$WORK/oldhp-root/etc"
+	printf 'DISTRIB_RELEASE="24.10.3"\n' > "$WORK/oldhp-root/etc/openwrt_release"
+	# the REAL previous revision, lifted from git — not a synthetic stand-in,
+	# because a stand-in cannot carry a chosen md5 and would prove nothing
+	cp -p "fixtures/oldhp/$tag" "$WORK/oldhp-root/$HP"
+	chmod 755 "$WORK/oldhp-root/$HP"
+	real_old="$(md5sum "$WORK/oldhp-root/$HP" | cut -d' ' -f1)"
+	conf_old="$(grep "^${HP}\\|" ../metadata/fingerprints.conf | cut -d'|' -f5 | tr ',' '\n' | grep -c "$real_old")"
+	if [ "$conf_old" != 1 ]; then
+		echo "FAIL: $tag fixture md5 $real_old is not in the known-old set"
+		echo "      the fixture and the fingerprint table have drifted apart"
+		exit 1
+	fi
+	run_install "$WORK/oldhp-root" apply > "$WORK/run15.$i.log" 2>&1 || { echo "FAIL: install exited nonzero"; exit 1; }
+	now="$(md5sum "$WORK/oldhp-root/$HP" | cut -d' ' -f1)"
+	[ "$now" = "$HP_CANON" ] || { echo "FAIL: known-old $tag ($real_old) not replaced (now $now)"; exit 1; }
+	ran15=$((ran15+1)); i=$((i+1))
+done
+[ "$ran15" = 2 ] || { echo "FAIL: only $ran15/2 known-old cases actually ran"; exit 1; }
+echo "PASS: both known-old hotplug fingerprints replaced with canonical ($ran15/2 ran)"
+
+echo
+echo "== TEST 16: hotplug with an UNKNOWN fingerprint is report-only =="
+# The never-clobber property must survive the new flag. install-if-missing=1
+# permits CREATING a file; it must never permit overwriting an unrecognised one.
+rm -rf "$WORK/unkhp-root"; mkdir -p "$WORK/unkhp-root/$(dirname "$HP")" "$WORK/unkhp-root/etc"
+printf 'DISTRIB_RELEASE="24.10.3"\n' > "$WORK/unkhp-root/etc/openwrt_release"
+printf '#!/bin/sh\n# locally modified, we have never seen this\n' > "$WORK/unkhp-root/$HP"
+chmod 755 "$WORK/unkhp-root/$HP"
+unk_before="$(md5sum "$WORK/unkhp-root/$HP" | cut -d' ' -f1)"
+# Guard: if the file were somehow absent this would degrade into TEST 13 and
+# pass for the wrong reason. An unknown-fingerprint test needs a present file.
+[ -n "$unk_before" ] || { echo "FAIL: TEST 16 setup error — unknown hotplug not on disk, test would be vacuous"; exit 1; }
+[ "$unk_before" != "$HP_CANON" ] || { echo "FAIL: TEST 16 setup error — unknown file is actually canonical"; exit 1; }
+out16="$(run_install "$WORK/unkhp-root" apply 2>&1)"
+printf '%s\n' "$out16" | grep -q "50-z8102-wan6-mwan3: unknown on-box state" \
+	|| { echo "FAIL: unknown hotplug fingerprint not reported"; printf '%s\n' "$out16"; exit 1; }
+unk_after="$(md5sum "$WORK/unkhp-root/$HP" | cut -d' ' -f1)"
+[ "$unk_before" = "$unk_after" ] \
+	|| { echo "FAIL: unknown hotplug fingerprint was overwritten ($unk_before -> $unk_after)"; exit 1; }
+echo "PASS: unknown hotplug fingerprint left untouched, warned, backed up"
+
+echo
+echo "== TEST 17: FLAVOUR SAFETY — the other 7 payloads still skip when missing =="
+# Regression guard for the trap in the design: ROOter ships with and without
+# mwan3. On the non-MWAN3 flavour luci-mwan3 and mwan3track have no
+# destination, and "missing means install" would drop an mwan3 tracker binary
+# and a LuCI app into firmware that has no mwan3 at all. Only the hotplug
+# carries install-if-missing=1; everything else must still be a no-op.
+rm -rf "$WORK/bare2-root"; mkdir -p "$WORK/bare2-root/etc"
+printf 'DISTRIB_RELEASE="24.10.3"\n' > "$WORK/bare2-root/etc/openwrt_release"
+out17="$(run_install "$WORK/bare2-root" apply 2>&1)"
+leaked=0
+for f in usr/lib/rooter/connect/create_hostless.sh \
+         usr/lib/rooter/connect/handlettl.sh \
+         usr/lib/rooter/connect/get_profile.sh \
+         usr/lib/lua/luci/model/cbi/rooter/profiles.lua \
+         usr/lib/rooter/luci/restartrun.sh \
+         usr/libexec/luci-mwan3 \
+         usr/sbin/mwan3track; do
+	if [ -e "$WORK/bare2-root/$f" ]; then
+		echo "FAIL: $f was installed onto a box that does not have it (flavour safety broken)"
+		leaked=1
+	fi
+done
+[ "$leaked" = 0 ] || exit 1
+# and the hotplug, which opted in, must have been created
+[ -f "$WORK/bare2-root/$HP" ] || { echo "FAIL: opted-in hotplug was not created on a bare root"; exit 1; }
+echo "PASS: 7 un-opted-in payloads skipped when absent; hotplug still installed"
+
+echo
+echo "== TEST 18: the REAL stock mwan3 config converges to the documented shape =="
+# Fixture is the shipped /etc/config/mwan3 lifted verbatim out of
+# ZBT-Z8102AX-V2-MWAN3-GO2026-04-25-upgrade.bin (md5 65b6b267311285a08df917d192731f0a),
+# not a hand-written approximation.
+#
+# That file is STATIC: 22 members covering all five modem slots regardless of
+# the box's "Multiple Modems" setting. maxmodem sizes /etc/config/network
+# (generated at first boot by config_generate), not this. A 4-modem box with one
+# populated modem still carries all 22. Measured, not assumed.
+awk '
+/^[[:space:]]*config /{ if(n)print n"\t"t"\t"f"\t"tr"\t"fl; n="";t="";f="";tr="";fl="" }
+/^[[:space:]]*config interface/{ split($0,a,/'"'"'/); n=a[2]; t="interface" }
+/^[[:space:]]*config globals/{ t="globals"; n="globals" }
+/^[[:space:]]*option family/{ f=$NF; gsub(/'"'"'/,"",f) }
+/^[[:space:]]*list track_ip/{ v=$NF; gsub(/'"'"'/,"",v); tr=tr (tr==""?"":" ") v }
+/^[[:space:]]*list flush_conntrack/{ v=$NF; gsub(/'"'"'/,"",v); fl=fl (fl==""?"":" ") v }
+END{ if(n)print n"\t"t"\t"f"\t"tr"\t"fl }
+' fixtures/stock/config-mwan3 > "$WORK/mwan3.real"
+
+n_if="$(awk -F'\t' '$2=="interface"' "$WORK/mwan3.real" | wc -l)"
+n_v6="$(awk -F'\t' '$2=="interface" && $3=="ipv6"' "$WORK/mwan3.real" | wc -l)"
+n_v4="$(awk -F'\t' '$2=="interface" && $3=="ipv4"' "$WORK/mwan3.real" | wc -l)"
+[ "$n_if" = 22 ] || { echo "FAIL: fixture should hold 22 members, parsed $n_if"; exit 1; }
+[ "$n_v6" = 8 ]  || { echo "FAIL: expected 8 ipv6 members, parsed $n_v6"; exit 1; }
+[ "$n_v4" = 14 ] || { echo "FAIL: expected 14 ipv4 members, parsed $n_v4"; exit 1; }
+
+out18="$(X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"; \
+	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+	MWAN3_STUB_FILE="$WORK/mwan3.real" sh ../install.sh --check 2>&1)"
+
+# every ipv6 member loses its churn events and keeps its link transitions
+bad6=0
+awk -F'\t' '$2=="interface" && $3=="ipv6"{print $1}' "$WORK/mwan3.real" | while read -r m; do
+	printf '%s\n' "$out18" | grep -q "mwan3 interface '$m': flush_conntrack 'connected disconnected ifup ifdown' -> 'ifup ifdown'" \
+		|| { echo "FAIL: ipv6 member '$m' did not converge to 'ifup ifdown'"; exit 1; }
+done || bad6=1
+[ "$bad6" = 0 ] || { printf '%s\n' "$out18"; exit 1; }
+
+# every ipv4 member is left exactly as stock. The v4 churn flush is upstream
+# behaviour and out of scope: removing it is a separate decision, not a repair.
+bad4=0
+awk -F'\t' '$2=="interface" && $3=="ipv4"{print $1}' "$WORK/mwan3.real" | while read -r m; do
+	if printf '%s\n' "$out18" | grep -q "mwan3 interface '$m': flush_conntrack"; then
+		echo "FAIL: ipv4 member '$m' had its flush_conntrack touched — v4 churn is out of scope"
+		exit 1
+	fi
+done || bad4=1
+[ "$bad4" = 0 ] || { printf '%s\n' "$out18"; exit 1; }
+
+# hostname track_ip targets become numerics on both families
+for m in wan1_6 wan5_6; do
+	printf '%s\n' "$out18" | grep -q "mwan3 interface '$m': replace hostname track_ip with 2606:4700::1001" \
+		|| { echo "FAIL: $m kept hostname track_ip targets"; exit 1; }
+done
+printf '%s\n' "$out18" | grep -q "mwan3 interface 'wan1': replace hostname track_ip with 1.1.1.1 8.8.8.8 9.9.9.9" \
+	|| { echo "FAIL: ipv4 wan1 kept hostname track_ip targets"; exit 1; }
+echo "PASS: 8/8 ipv6 -> 'ifup ifdown', 14/14 ipv4 untouched, hostnames -> numerics"
+
+echo
+echo "== TEST 19: an absent-member set is trimmed too, and that is intended =="
+# Five of the eight ipv6 members (wan3_6, wan4_6, wan5_6, wwan26, wwan56) name
+# modem slots a given box may not have populated: maxmodem=4 on the reference
+# box, yet /etc/config/network has no wan5 while mwan3 declares wan5_6. We
+# still trim them. It is invisible with no interface present, and it means a
+# modem retrofitted later is already correct. Asserted so it stays a decision
+# rather than an accident of iterating every member.
+out19="$(X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"; \
+	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+	MWAN3_STUB_FILE="$WORK/mwan3.real" sh ../install.sh --check 2>&1)"
+for m in wan3_6 wan4_6 wan5_6 wwan26 wwan56; do
+	printf '%s\n' "$out19" | grep -q "mwan3 interface '$m': flush_conntrack .*-> 'ifup ifdown'" \
+		|| { echo "FAIL: absent-member '$m' was not trimmed"; exit 1; }
+done
+echo "PASS: members with no populated modem are trimmed as well"
 
 echo
 echo "== ALL OFFLINE TESTS PASSED =="

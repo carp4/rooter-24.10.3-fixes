@@ -1,0 +1,48 @@
+#!/bin/sh
+# z8102: upstream (T-Mo gateway) rotates the delegated /64 on renew.
+# mwan3 pins each member's IPv6 source at tracking time and stays "offline"
+# forever after the prefix changes. Restart mwan3 (re-derives all sources)
+# whenever the GUA actually changes so the member never sticks offline.
+# Two cases:
+#   ROTATION: globals set changed (added/removed prefixes) -> mwan3 restart
+#   WITHDRAWAL: zero globals left -> force dhcpv6 re-solicit on the device,
+#               then the following ifup will restart mwan3 normally.
+# (Copied into the ROOter tree from the z8102-custom-config gold feed —
+# same file, /etc/hotplug.d/iface/50-z8102-wan6-mwan3.)
+
+[ "$ACTION" = "ifupdate" ] || exit 0
+
+# Only iface events belonging to an enabled ipv6 mwan3 member matter.
+[ "$(uci -q get mwan3.$INTERFACE.family 2>/dev/null)" = "ipv6" ] || exit 0
+[ "$(uci -q get mwan3.$INTERFACE.enabled 2>/dev/null)" = "1" ] || exit 0
+
+# Resolve the member's underlying device ('@wanN' -> network.wanN.device).
+device=$(uci -q get network.$INTERFACE.device 2>/dev/null)
+case "$device" in
+	@*) dev=$(uci -q get network.${device#@}.device 2>/dev/null) ;;
+	*)  dev="$device" ;;
+esac
+[ -n "$dev" ] || exit 0
+
+STATE=/tmp/zz-wan6-gua-$dev
+# Full sorted global set for this device (order-independent, ignores deprecations).
+NOW=$(ip -6 addr show dev "$dev" scope global 2>/dev/null \
+	| awk '/inet6/{print $2}' | sort -u | tr '\n' ' ')
+
+if [ -z "$NOW" ]; then
+	# WITHDRAWAL: no globals at all. Force dhcpv6 re-solicit on the device.
+	# Don't restart mwan3 here — tracker has no candidates to re-derive.
+	# The subsequent ifup will trigger the normal rotation path.
+	logger -t z8102-wan6 "$dev globals withdrawn; forcing dhcpv6 re-solicit on $INTERFACE"
+	/sbin/ifup "$dev"
+	echo "$NOW" > "$STATE"
+	exit 0
+fi
+
+# ROTATION: non-empty set changed (added/removed prefixes).
+[ "$NOW" = "$(cat "$STATE" 2>/dev/null)" ] && exit 0
+echo "$NOW" > "$STATE"
+
+/etc/init.d/mwan3 running || exit 0
+logger -t z8102-wan6 "$dev global set changed ($(echo "$NOW" | wc -w) globals); restarting mwan3"
+/etc/init.d/mwan3 restart

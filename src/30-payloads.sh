@@ -3,23 +3,13 @@
 # The payload table variable ROOTUP_TABLE is injected by build.sh as a
 # single-quoted, newline-separated block (embedded after this file).
 # Row format (pipe-separated):
-#   name|destination|mode|canonical-md5|known-old-md5[,old2...]|base64
+#   name|destination|mode|canonical-md5|known-old-md5[,old2...]|install-if-missing|base64
 # Policy per file:
 #   on-box == canonical                     -> SKIP (already current)
 #   on-box in known-old set                 -> REPLACE (backup first)
 #   on-box anything else                    -> REPORT-ONLY (backup + warn, never touch)
-#   file missing                            -> NOTE  (box predates/lacks it; nothing to do)
-# ---------------------------------------------------------------------------
-
-# The payload table variable ROOTUP_TABLE is injected by build.sh as a
-# single-quoted, newline-separated block (emitted before this file).
-# Row format (pipe-separated):
-#   name|destination|mode|canonical-md5|known-old-md5[,old2...]|base64
-# Policy per file:
-#   on-box == canonical                     -> SKIP (already current)
-#   on-box in known-old set                 -> REPLACE (backup first)
-#   on-box anything else                    -> REPORT-ONLY (backup + warn, never touch)
-#   file missing                            -> NOTE  (box predates/lacks it; nothing to do)
+#   file missing, install-if-missing=0      -> NOTE  (box predates/lacks it; nothing to do)
+#   file missing, install-if-missing=1      -> CREATE (install it; there is nothing to back up)
 # ---------------------------------------------------------------------------
 
 # install_payloads: walk the embedded table
@@ -31,20 +21,26 @@ install_payloads() {
 	for row in $ROOTUP_TABLE; do
 		IFS="|"
 		set -- $row
-		name="$1"; dest="$2"; mode="$3"; canon="$4"; olds="$5"; b64="$6"
+		name="$1"; dest="$2"; mode="$3"; canon="$4"; olds="$5"; ifmiss="$6"; b64="$7"
 		IFS="$OLDIFS"
 		[ -n "$name" ] || continue
-		payload_apply "$name" "$dest" "$mode" "$canon" "$olds" "$b64"
+		payload_apply "$name" "$dest" "$mode" "$canon" "$olds" "$ifmiss" "$b64"
 	done
 	IFS="$OLDIFS"
 }
 
-# payload_apply NAME DEST MODE CANON OLDS B64
+# payload_apply NAME DEST MODE CANON OLDS IFMISS B64
 payload_apply() {
-	name="$1"; dest="$2"; mode="$3"; canon="$4"; olds="$5"; b64="$6"
+	name="$1"; dest="$2"; mode="$3"; canon="$4"; olds="$5"; ifmiss="$6"; b64="$7"
 	onbox="$(fmd5 "$dest")"
 
-	if [ -z "$onbox" ]; then
+	# An absent destination is normal, not an error: this installer targets a
+	# product that ships in two flavours, and on the non-MWAN3 one the mwan3
+	# files have no destination at all. So "missing" means do-nothing by
+	# default, and a payload that must also be CREATEd opts in via ifmiss=1.
+	# build.sh rejects any value other than 0 or 1, so a typo cannot silently
+	# mean "install" or silently mean "skip".
+	if [ -z "$onbox" ] && [ "$ifmiss" != 1 ]; then
 		note "$name: not present on box, nothing to do"
 		return 0
 	fi
@@ -70,6 +66,24 @@ payload_apply() {
 	if [ "$payloadmd5" != "$canon" ]; then
 		fail "$name: embedded payload md5 mismatch (got $payloadmd5, want $canon) — build artifact broken"
 		return 1
+	fi
+
+	# An absent file has no fingerprint, so the known-old test cannot match it.
+	# ifmiss=1 is the only way past that branch, and it is the ONLY path that
+	# creates a file rather than replacing one.
+	if [ -z "$onbox" ]; then
+		if [ "$MODE" = "check" ]; then
+			note "$name: would install (not present on box)"
+			return 0
+		fi
+		# No backup_file call: there is no prior file to preserve, and calling it
+		# would only add an empty entry to the rollback manifest.
+		mkdir -p "$(dirname "$(rp "$dest")")" || { fail "$name: cannot create $(dirname "$dest")"; return 1; }
+		cp -f "$tmp" "$(rp "$dest")" || { fail "$name: install failed"; return 1; }
+		chmod "$mode" "$(rp "$dest")"
+		CHANGED=$((CHANGED+1))
+		ok "$name: installed (was not present)"
+		return 0
 	fi
 
 	# known-old set contains the on-box fingerprint -> replace

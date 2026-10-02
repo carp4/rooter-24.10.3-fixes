@@ -1,0 +1,103 @@
+#!/bin/sh
+# z8102: upstream (T-Mo gateway) rotates the delegated /64 on renew.
+# mwan3 pins each member's IPv6 source at tracking time and stays "offline"
+# forever after the prefix changes. Restart mwan3 (re-derives all sources)
+# whenever the GUA actually changes so the member never sticks offline.
+#
+# Two cases, because they need opposite responses:
+#   ROTATION: globals set changed (added/removed prefixes) -> mwan3 restart.
+#   WITHDRAWAL: the last global disappeared and netifd has not noticed ->
+#               cycle the interface so odhcp6c re-solicits DHCPv6. Restarting
+#               mwan3 cannot help here: the tracker has no address left to
+#               re-derive to, so it would stay offline against a link that
+#               is being advertised as up.
+#
+# (Copied into the ROOter tree from the z8102-custom-config gold feed --
+# same file, /etc/hotplug.d/iface/50-z8102-wan6-mwan3. The log tag is still
+# z8102-wan6 so existing logread greps keep matching.)
+
+[ "$ACTION" = "ifupdate" ] || exit 0
+
+# Only iface events belonging to an enabled ipv6 mwan3 member matter.
+[ "$(uci -q get mwan3.$INTERFACE.family 2>/dev/null)" = "ipv6" ] || exit 0
+[ "$(uci -q get mwan3.$INTERFACE.enabled 2>/dev/null)" = "1" ] || exit 0
+
+# Resolve the member's underlying device ('@wanN' -> network.wanN.device).
+device=$(uci -q get network.$INTERFACE.device 2>/dev/null)
+case "$device" in
+	@*) dev=$(uci -q get network.${device#@}.device 2>/dev/null) ;;
+	*)  dev="$device" ;;
+esac
+[ -n "$dev" ] || exit 0
+
+STATE=/tmp/zz-wan6-gua-$dev
+# Full sorted global set for this device (order-independent, ignores deprecations).
+NOW=$(ip -6 addr show dev "$dev" scope global 2>/dev/null \
+	| awk '/inet6/{print $2}' | sort -u | tr '\n' ' ')
+
+if [ -z "$NOW" ]; then
+	prev="$(cat "$STATE" 2>/dev/null)"
+
+	# A withdrawal is a TRANSITION: globals were there, now they are not.
+	# At boot, or while a modem is still coming up, NOW is empty and so is
+	# STATE -- that is "not up yet", not a withdrawal, and cycling the
+	# interface there would fight modem bring-up. This same guard is what
+	# stops the ifupdate event raised by our own cycle from cycling again,
+	# which would otherwise loop until the attempt cap.
+	[ -n "$prev" ] || exit 0
+
+	# Bounded recovery: at most 3 cycles and never closer together than
+	# 120s, so a carrier that really has withdrawn the prefix is not
+	# hammered, and a cycle that fails is retried rather than abandoned.
+	mark=/tmp/zz-wan6-cycled-$dev
+	set -- $(cat "$mark" 2>/dev/null)
+	tries="${1:-0}"; lastt="${2:-0}"
+	case "$tries" in ''|*[!0-9]*) tries=0 ;; esac
+	case "$lastt" in ''|*[!0-9]*) lastt=0 ;; esac
+	ts=$(date +%s 2>/dev/null)
+	case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+
+	if [ "$tries" -ge 3 ]; then
+		logger -t z8102-wan6 "$dev: still no globals after $tries cycles - giving up, leaving it to modem reconnect"
+		# Clear STATE so this branch is not re-entered (and re-logged) on
+		# every subsequent event. If a global does come back, the rotation
+		# path below sees a difference and recovers normally.
+		echo "$NOW" > "$STATE"
+		rm -f "$mark"
+		exit 0
+	fi
+	if [ "$lastt" -gt 0 ] && [ $((ts - lastt)) -lt 120 ]; then
+		logger -t z8102-wan6 "$dev: no globals $((ts - lastt))s after a cycle - not cycling again yet"
+		exit 0
+	fi
+
+	echo "$((tries + 1)) $ts" > "$mark"
+
+	# ifup/ifdown take an INTERFACE name, not a device name. Passing "$dev"
+	# here fails with "Interface usb1 not found" and recovers nothing, which
+	# is exactly the silent no-op this branch existed to avoid.
+	logger -t z8102-wan6 "$dev: last global withdrawn (had: $prev); cycling $INTERFACE (attempt $((tries + 1))/3)"
+	if ifdown "$INTERFACE" >/dev/null 2>&1; then
+		:
+	else
+		logger -t z8102-wan6 "$INTERFACE: ifdown failed"
+	fi
+	if ifup "$INTERFACE" >/dev/null 2>&1; then
+		logger -t z8102-wan6 "$INTERFACE: cycled, waiting for DHCPv6 re-solicit"
+	else
+		rc=$?
+		logger -t z8102-wan6 "$INTERFACE: ifup failed rc=$rc"
+	fi
+	exit 0
+fi
+
+# ROTATION: non-empty set changed (added/removed prefixes).
+[ "$NOW" = "$(cat "$STATE" 2>/dev/null)" ] && exit 0
+echo "$NOW" > "$STATE"
+# Globals are back: clear the withdrawal attempt budget so a later
+# withdrawal gets a fresh set of cycles.
+rm -f /tmp/zz-wan6-cycled-$dev
+
+/etc/init.d/mwan3 running || exit 0
+logger -t z8102-wan6 "$dev global set changed ($(echo "$NOW" | wc -w) globals); restarting mwan3"
+/etc/init.d/mwan3 restart

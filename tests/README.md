@@ -31,6 +31,32 @@ dry-run/report shape).
 | 2 | apply on old root | all 5 files end up canonical md5; backup dir + `rollback.sh` created |
 | 3 | re-apply on old root | idempotent — "already current" |
 | 4 | apply on new root | no-op — all canonical, "already current" |
+| 5 | rollback | generated `rollback.sh` restores the pre-replace stock state |
+| 6 | mwan3 diag fix | IPv6-aware, gated, attributed; stock file is IPv4-only |
+| 7 | mwan3 diag fix | the reported bug is actually fixed — and stock FAILS the same harness |
+| 8 | `mwan3track` fix | recovers a stale ipv6 source pin; stock has no such logic |
+| 9 | member discovery | members found by name, `rule_v6` excluded, ipv4 untouched |
+| 10 | activation gate | intent reported in `--check`, executed only in apply |
+| 11 | discovery vs hardcoding | member set follows the box, nothing baked in |
+| 12 | v6 flush fix | churn removed; `ifup`/`ifdown` never invented; churn-only ends empty |
+| 13 | hotplug absent | **created**, canonical bytes, mode 755 — the stock-flash case |
+| 14 | hotplug canonical | skipped; re-run is a no-op |
+| 15 | hotplug known-old | both real prior revisions (r10, r9) replaced |
+| 16 | hotplug unknown | report-only — an unrecognised fingerprint is never overwritten |
+| 17 | flavour safety | the 7 payloads without `install-if-missing=1` still skip when absent |
+| 18 | real stock config | 8/8 ipv6 → `ifup ifdown`, 14/14 ipv4 untouched, hostnames → numerics |
+| 19 | unpopulated slots | members with no modem present are trimmed too, deliberately |
+
+Tests 13 and 17 are guards against opposite mistakes: 13 fails if
+`install-if-missing` is dropped, 17 fails if it is widened to a global
+"missing means install" policy (which would put mwan3 binaries into non-MWAN3
+firmware). Both were negative-controlled before being trusted.
+
+Test 18 and 19 use `fixtures/stock/config-mwan3`, the **real shipped**
+`/etc/config/mwan3` (18,540 bytes, md5 `65b6b267311285a08df917d192731f0a`)
+lifted verbatim out of `ZBT-Z8102AX-V2-MWAN3-GO2026-04-25-upgrade.bin`. It
+holds all 22 members because that file is static — modem count sizes
+`/etc/config/network`, not this.
 
 ## Run
 
@@ -73,6 +99,23 @@ effect when explicitly exported before invoking `install.sh`.
 - Real `uci` commit/apply behavior and firewall/network/odhcpd service
   reloads (`svc()` is stubbed to no-op).
 - Actual nft rule installation from the fixed `handlettl.sh`.
-- The mwan3 numeric track-target rewrite against a real mwan3 config.
-- Boxes carrying an UNKNOWN md5 variant (report-only path) — needs a real
-  pre-b19 box in the fleet.
+- That the withdrawal hotplug actually fires on a real `ifupdate` event and
+  recovers the member. Test 13 only proves the bytes land in the right place
+  with the right mode; the mechanism was validated separately against a real
+  carrier withdrawal on 2026-10-02.
+- Boxes carrying an UNKNOWN md5 variant other than the synthetic one in
+  test 16 (report-only path) — needs a real box in the fleet.
+
+## Fixtures
+
+| path | provenance |
+|------|-----------|
+| `fixtures/stock/luci-mwan3` | byte-identical to the file in the stock image |
+| `fixtures/stock/mwan3track` | byte-identical to the file in the stock image |
+| `fixtures/stock/config-mwan3` | byte-identical to `/etc/config/mwan3` in the stock image |
+| `fixtures/oldhp/r10` | the real r10 hook, extracted from `source2410` git `7340af0f` |
+| `fixtures/oldhp/r9` | the real r9 hook, extracted from `source2410` git `f5cda0be` |
+
+Every fixture is genuine bytes. Synthetic stand-ins cannot carry a chosen md5,
+so a fabricated "old" file would either miss the fingerprint or accidentally
+hit it — either way it would prove nothing.

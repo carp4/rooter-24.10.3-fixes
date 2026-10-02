@@ -40,7 +40,7 @@
 #   ROOTUP_SKIP_NFT=1    skip live nft verification
 # ============================================================================
 
-VERSION="1.1.3"
+VERSION="1.2.0"
 ROOT="${ROOTUP_ROOT:-/}"
 TESTMODE="${ROOTUP_TEST:-0}"
 PROCFS="${ROOTUP_PROCFS:-/proc}"
