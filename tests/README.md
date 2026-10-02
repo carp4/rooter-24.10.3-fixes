@@ -46,11 +46,21 @@ dry-run/report shape).
 | 17 | flavour safety | the 7 payloads without `install-if-missing=1` still skip when absent |
 | 18 | real stock config | 8/8 ipv6 → `ifup ifdown`, 14/14 ipv4 untouched, hostnames → numerics |
 | 19 | unpopulated slots | members with no modem present are trimmed too, deliberately |
+| 20 | stock-image coverage | **no** payload is report-only against the real stock image |
 
 Tests 13 and 17 are guards against opposite mistakes: 13 fails if
 `install-if-missing` is dropped, 17 fails if it is widened to a global
 "missing means install" policy (which would put mwan3 binaries into non-MWAN3
 firmware). Both were negative-controlled before being trusted.
+
+Test 20 exists because of a bug found on hardware, not in the abstract. The
+fingerprint table was built from "b16 stock / b18-era" bytes, but the
+`MWAN3 GO2026-04-25` image ships different stock bytes for `create_hostless.sh`
+and `restartrun.sh`. Both fell through to report-only, so `--apply` would have
+shipped **5 of 7** payloads, left fix 3 half-installed, and still exited 0
+printing "Done." A partial fix that reports success is worse than no fix. Test
+20 seeds a root from the image's own bytes and fails on any report-only
+outcome; removing either md5 makes it fail and name the payload.
 
 Test 18 and 19 use `fixtures/stock/config-mwan3`, the **real shipped**
 `/etc/config/mwan3` (18,540 bytes, md5 `65b6b267311285a08df917d192731f0a`)
@@ -110,12 +120,18 @@ effect when explicitly exported before invoking `install.sh`.
 
 | path | provenance |
 |------|-----------|
-| `fixtures/stock/luci-mwan3` | byte-identical to the file in the stock image |
-| `fixtures/stock/mwan3track` | byte-identical to the file in the stock image |
-| `fixtures/stock/config-mwan3` | byte-identical to `/etc/config/mwan3` in the stock image |
+| `fixtures/stock/{create_hostless,handlettl,get_profile}.sh` | byte-identical to the file in `ZBT-Z8102AX-V2-MWAN3-GO2026-04-25-upgrade.bin` |
+| `fixtures/stock/profiles.lua` | byte-identical to the file in the same image |
+| `fixtures/stock/restartrun.sh` | byte-identical to the file in the same image |
+| `fixtures/stock/luci-mwan3` | byte-identical to the file in the same image |
+| `fixtures/stock/mwan3track` | byte-identical to the file in the same image |
+| `fixtures/stock/config-mwan3` | byte-identical to `/etc/config/mwan3` in the same image |
 | `fixtures/oldhp/r10` | the real r10 hook, extracted from `source2410` git `7340af0f` |
 | `fixtures/oldhp/r9` | the real r9 hook, extracted from `source2410` git `f5cda0be` |
 
 Every fixture is genuine bytes. Synthetic stand-ins cannot carry a chosen md5,
 so a fabricated "old" file would either miss the fingerprint or accidentally
 hit it — either way it would prove nothing.
+
+There is deliberately **no** stock fixture for the withdrawal hotplug: stock
+ships no such file, which is what `install-if-missing=1` exists to handle.

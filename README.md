@@ -188,16 +188,37 @@ notice if the fix stopped working":
   members converge to `ifup ifdown` and all 14 ipv4 members are untouched.
 - **19** pins the intent that members naming unpopulated modem slots are fixed
   too, so it stays a decision rather than an accident of iteration.
+- **20** builds a root from the **real stock bytes of all seven payload
+  destinations** and fails if any would be report-only. This exists because a
+  stock image with different bytes silently reduced the installer to 5 of 7
+  payloads while still exiting 0 and printing "Done."
 
-Tests 13 and 17 were negative-controlled: flipping the hotplug's flag to `0`
-makes 13 fail, and flipping all eight flags to `1` makes 17 fail.
+Tests 13, 17 and 20 were negative-controlled: flipping the hotplug's flag to
+`0` makes 13 fail, flipping all eight flags to `1` makes 17 fail, and removing
+either newly-learned stock md5 makes 20 fail and name the payload.
 
 Stock-vs-canonical bytes come from **checked-in fixtures** under
-`tests/fixtures/stock/`, not from `git HEAD`. The tree files are frequently
-uncommitted working state, so `HEAD` would hand the test the already-fixed
-version and every assertion would be vacuous.
+`tests/fixtures/stock/` — the real bytes lifted out of the stock image, not
+from `git HEAD`. The tree files are frequently uncommitted working state, so
+`HEAD` would hand the test the already-fixed version and every assertion would
+be vacuous.
 
 ## Changelog
+
+### v1.2.1
+
+- Found by flashing the real `ZBT-Z8102AX-V2-MWAN3-GO2026-04-25` image and
+  auditing it before applying: **two payloads were report-only, not
+  replaced.** The fingerprint table had been built from "b16 stock / b18-era"
+  bytes, but that image ships different stock bytes —
+  `create_hostless.sh` is `02a3d8a5…` (known-old held only `88107b57…`) and
+  `restartrun.sh` is `f288f84d…` (known-old was empty). `--apply` would have
+  shipped 5 of 7 payloads, left fix 3 half-installed, **and still exited 0
+  printing "Done."** Both md5s added.
+- New test 20 closes that class of bug: it seeds a root with the real stock
+  bytes of all seven payload destinations (lifted from the image itself, not
+  from `git HEAD`) and fails if any of them would be report-only. Negative-
+  controlled — removing either md5 makes it fail and name the payload.
 
 ### v1.2.0
 

@@ -952,6 +952,63 @@ printf '%s\n' "$out18" | grep -q "mwan3 interface 'wan1': replace hostname track
 echo "PASS: 8/8 ipv6 -> 'ifup ifdown', 14/14 ipv4 untouched, hostnames -> numerics"
 
 echo
+echo "== TEST 20: NO payload is report-only against the real stock image =="
+# Found on hardware 2026-10-02. The fingerprint table had been built from
+# "b16 stock / b18-era" bytes, but the MWAN3 GO2026-04-25 image ships DIFFERENT
+# stock bytes for two files:
+#
+#   create_hostless.sh  on-box 02a3d8a5…  known-old had only 88107b57…
+#   restartrun.sh      on-box f288f84d…  known-old was EMPTY
+#
+# Both fell through to report-only, so `--apply` would have silently shipped
+# 5 of 7 payloads and left fix 3 half-installed -- while still exiting 0 and
+# printing a cheerful "Done." That is the worst possible failure mode: a
+# partial fix that reports success.
+#
+# This test closes that class of bug for good. It builds a root containing the
+# REAL stock bytes of every payload destination (lifted from the image itself,
+# not from git HEAD) and requires that every one of them is either replaced or
+# already canonical. "unknown on-box state" anywhere is a failure.
+#
+# A new stock image with different bytes will fail here, which is the point:
+# the fingerprint table has to be taught the new image deliberately.
+rm -rf "$WORK/stockimg-root"; mkdir -p "$WORK/stockimg-root/etc"
+printf 'DISTRIB_RELEASE="24.10.3"\n' > "$WORK/stockimg-root/etc/openwrt_release"
+# map payload name -> fixture file; the hotplug has no stock fixture because
+# stock ships no such file, which is exactly what install-if-missing covers.
+seeded=0
+for n in create_hostless.sh handlettl.sh get_profile.sh profiles.lua restartrun.sh luci-mwan3 mwan3track; do
+	f="fixtures/stock/$n"
+	[ -f "$f" ] || { echo "FAIL: missing stock fixture $f — TEST 20 would be vacuous"; exit 1; }
+	dest="$(awk -F'|' -v N="$n" '$1==N{print $2}' ../metadata/fingerprints.conf)"
+	[ -n "$dest" ] || { echo "FAIL: $n has no row in fingerprints.conf"; exit 1; }
+	mkdir -p "$WORK/stockimg-root/$(dirname "$dest")"
+	cp -p "$f" "$WORK/stockimg-root/$dest"
+	chmod "$(awk -F'|' -v N="$n" '$1==N{print $3}' ../metadata/fingerprints.conf)" "$WORK/stockimg-root/$dest" 2>/dev/null
+	seeded=$((seeded+1))
+done
+[ "$seeded" = 7 ] || { echo "FAIL: seeded $seeded/7 destinations, TEST 20 would be vacuous"; exit 1; }
+
+out20="$(run_install "$WORK/stockimg-root" --check 2>&1)"
+if printf '%s\n' "$out20" | grep -q 'unknown on-box state'; then
+	echo "FAIL: the real stock image would leave these payloads REPORT-ONLY:"
+	printf '%s\n' "$out20" | grep 'unknown on-box state' | sed 's/^/    /'
+	echo "      add their md5 to the known-old set in metadata/fingerprints.conf"
+	exit 1
+fi
+# and each must actually be offered for replacement, not merely be quiet
+want=0; got=0
+for n in create_hostless.sh handlettl.sh get_profile.sh profiles.lua restartrun.sh luci-mwan3 mwan3track; do
+	want=$((want+1))
+	printf '%s\n' "$out20" | grep -q "$n: would replace" && got=$((got+1))
+done
+[ "$got" = "$want" ] || { echo "FAIL: only $got/$want stock payloads offered for replacement"; printf '%s\n' "$out20"; exit 1; }
+# the hotplug must be offered for creation on this same root
+printf '%s\n' "$out20" | grep -q "50-z8102-wan6-mwan3: would install (not present on box)" \
+	|| { echo "FAIL: hotplug not offered for creation on a root built from real stock bytes"; exit 1; }
+echo "PASS: 7/7 stock payloads replaceable, 0 report-only, hotplug created ($got/$want + hotplug)"
+
+echo
 echo "== TEST 19: an absent-member set is trimmed too, and that is intended =="
 # Five of the eight ipv6 members (wan3_6, wan4_6, wan5_6, wwan26, wwan56) name
 # modem slots a given box may not have populated: maxmodem=4 on the reference
