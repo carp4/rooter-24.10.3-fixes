@@ -153,14 +153,47 @@ cat > "$WORK/uci" <<'STUB'
 #   firewall.@zone[0].name -> wan ; network.wan1_6.proto -> dhcpv6
 #   network.wan6.proto -> dhcpv6 ; network.lan show -> ok (empty)
 #   profile.default.preserve -> 1 ; everything else -> "" (exit 0)
-case "$*" in
-	*modem.modem1.connected*) echo 1; exit 0 ;;
-	*modem.modem1.interface*) echo usb0; exit 0 ;;
-	*firewall.@zone\[0\].name*) echo wan; exit 0 ;;
-	*network.wan6.proto*) echo dhcpv6; exit 0 ;;
-	*network.wan1_6.proto*) echo dhcpv6; exit 0 ;;
-	*network.lan*proto*) echo static; exit 0 ;;
-	*profile.default.preserve*) echo 1; exit 0 ;;
+# Normalise argv FIRST. uciq() is `uci -q "$@"`, so the leading flags must
+# be shifted off before anything can key on the subcommand. Doing this after
+# the read dispatch made every pattern unreachable and the stub silently
+# answered "" — which looks exactly like an empty config and turns a working
+# installer into a no-op.
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-*) shift ;;
+		*) break ;;
+	esac
+done
+
+# WRITES are logged, not answered, and dispatched BEFORE the read table: a
+# pattern keyed on a bare option path also matches the corresponding write
+# (`add_list firewall.@zone[0].network=wan`), which would exit in the read
+# table and the call would never be recorded — making a mutation
+# indistinguishable from a no-op. That is precisely the false green these
+# tests exist to catch, so writes are matched on the SUBCOMMAND only.
+if [ -n "${UCI_LOG:-}" ]; then
+	case "$1" in
+		set|add_list|delete|add) printf '%s %s\n' "$1" "$2" >> "$UCI_LOG"; exit 0 ;;
+	esac
+fi
+
+# READS, keyed on "$1 $2" = "<subcommand> <key>".
+case "$1 $2" in
+	"get modem.modem1.connected") echo 1; exit 0 ;;
+	"get modem.modem1.interface") echo usb0; exit 0 ;;
+	"get firewall.@zone[0].name") echo wan; exit 0 ;;
+	# maxmodem drives the wan zone size; overridable per-test so the
+	# dynamic-sizing path is exercised rather than assumed.
+	"get maxmodem.maxmodem.maxmodem") echo "${MAXMODEM_STUB:-4}"; exit 0 ;;
+	# The wan zone's CURRENT membership and forward policy, so TEST 21-24
+	# can start from the real collapsed-string state and from a healthy one.
+	"get firewall.@zone[0].network") echo "${WANZONE_NET_STUB:-}"; exit 0 ;;
+	"get firewall.@zone[0].forward") echo "${WANZONE_FWD_STUB:-REJECT}"; exit 0 ;;
+	"get firewall.@zone[0].masq6") echo "${WANZONE_MASQ6_STUB:-}"; exit 0 ;;
+	"get network.wan6.proto") echo dhcpv6; exit 0 ;;
+	"get network.wan1_6.proto") echo dhcpv6; exit 0 ;;
+	"get network.lan.proto") echo static; exit 0 ;;
+	"get profile.default.preserve") echo 1; exit 0 ;;
 esac
 
 # --- mwan3 ---------------------------------------------------------------
@@ -168,17 +201,6 @@ esac
 #   <section-name>  <type>  <family>  <track_ips>  <flush_conntrack>
 # Blank <family> means the option is absent. Empty list fields are allowed.
 MF="${MWAN3_STUB_FILE:-/mwan3.model}"
-
-# Normalise argv BEFORE dispatching. uciq() is `uci -q "$@"`, so the
-# subcommand is NOT $1 — it is $2. Keying on $1 makes every branch
-# unreachable and the stub silently answers "", which looks exactly like an
-# empty mwan3 config and turns a working installer into a no-op.
-while [ $# -gt 0 ]; do
-	case "$1" in
-		-*) shift ;;
-		*) break ;;
-	esac
-done
 
 # `uci show mwan3` -> one line per option, values quoted like the real tool
 if [ "$1" = "show" ] && [ "$2" = "mwan3" ]; then
@@ -198,6 +220,10 @@ fi
 # Section lookup is a plain string compare, not a grep pattern: real section
 # names may contain regex metacharacters, and an unescaped match would either
 # miss a member or hit the wrong one.
+# Write log: record every mutating uci call so tests can assert on what the
+# installer ACTUALLY did. Without this the stub silently no-ops and a broken
+# rebuild is indistinguishable from a correct one — the exact class of false
+# green these tests exist to catch. Set UCI_LOG=<file> to enable.
 if [ "$1" = "get" ]; then
 	key="$2"
 	case "$key" in
@@ -1026,5 +1052,133 @@ for m in wan3_6 wan4_6 wan5_6 wwan26 wwan56; do
 done
 echo "PASS: members with no populated modem are trimmed as well"
 
-echo
-echo "== ALL OFFLINE TESTS PASSED =="
+  echo
+  echo "== TEST 21: the collapsed wan zone string is REBUILT, not appended to =="
+  # The real defect. ROOter's initialize.sh do_zone() builds the zone list with
+  # `uci_set` + a space-joined string; `uci set` does not split whitespace on a
+  # list option, so fw4 receives ONE element naming a network called
+  # "wan wan6 wan1 ..." which resolves to nothing. Verified live: the only
+  # wan-zone device in the ruleset was usb1, present solely because roo_fix
+  # had appended a discrete wan2_6.
+  rm -f "$WORK/uci.log21"
+  out21="$(MAXMODEM_STUB=4 \
+  	WANZONE_NET_STUB='wan wan6 wan1 wan2 wan3 wan4 wan5 wwan2 wwan5' \
+  	WANZONE_FWD_STUB=REJECT \
+  	UCI_LOG="$WORK/uci.log21" \
+  	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+  	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+  	MWAN3_STUB_FILE="$WORK/mwan3.model" sh ../install.sh --apply 2>&1)"
+
+  # 1. the whole option must be deleted first — an append can never remove it
+  grep -qxF 'delete firewall.@zone[0].network' "$WORK/uci.log21" \
+  	|| { echo "FAIL: zone network option was not deleted — an append cannot repair a collapsed string"; printf '%s\n' "$out21"; exit 1; }
+
+  # 2. every member must be added back as a DISCRETE add_list
+  for n in wan wan6 wan1 wan1_6 wan2 wan2_6 wan3 wan3_6 wan4 wan4_6 wwan2 wwan5; do
+  	grep -qxF "add_list firewall.@zone[0].network=$n" "$WORK/uci.log21" \
+  		|| { echo "FAIL: '$n' not added as a discrete list entry"; printf '%s\n' "$out21"; exit 1; }
+  done
+
+  # 3. no member may be written with `set` — that is the bug's own mechanism
+  if grep -qF 'set firewall.@zone[0].network=' "$WORK/uci.log21"; then
+  	echo "FAIL: used 'uci set' on the zone list — that is exactly what collapses it"
+  	exit 1
+  fi
+
+  # 4. eth1's networks must now be present: these were the ones being lost
+  grep -qxF "add_list firewall.@zone[0].network=wan1" "$WORK/uci.log21" \
+  	|| { echo "FAIL: wan1 (usb0) still not in the zone"; exit 1; }
+  grep -qxF "add_list firewall.@zone[0].network=wan6" "$WORK/uci.log21" \
+  	|| { echo "FAIL: wan6 (eth1) still not in the zone"; exit 1; }
+  echo "PASS: collapsed string rebuilt as 12 discrete entries; no 'uci set' on the list"
+
+  echo
+  echo "== TEST 22: zone size follows maxmodem, not a hardcoded modem count =="
+  # ROOter sizes the modem count at runtime; the 25.12 gold hardcodes six
+  # members because the Z8102 topology is fixed. Matching the gold's SHAPE
+  # (discrete add_list entries) while DERIVING the count is the whole point.
+  for mc in 1 2 4 5; do
+  	rm -f "$WORK/uci.log22"
+  	MAXMODEM_STUB="$mc" \
+  	WANZONE_NET_STUB='wan wan6 wan1' \
+  	WANZONE_FWD_STUB=DROP \
+  	UCI_LOG="$WORK/uci.log22" \
+  	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+  	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+  	MWAN3_STUB_FILE="$WORK/mwan3.model" sh ../install.sh --apply >/dev/null 2>&1
+  	# Probed via the `wan<N>_6` names, NOT `wan<N>`. `wan6` is ambiguous:
+  	# it is eth1's IPv6 upstream and is ALWAYS in the zone regardless of
+  	# the modem count, so using it to detect "modem slot 6" reports a leak
+  	# on every single run. `wan6_6` has no such collision.
+  	highest=0
+  	for k in 1 2 3 4 5; do
+  		grep -qxF "add_list firewall.@zone[0].network=wan${k}_6" "$WORK/uci.log22" && highest=$k
+  	done
+  	[ "$highest" = "$mc" ] \
+  		|| { echo "FAIL: maxmodem=$mc produced modem slots up to wan${highest}_6"; exit 1; }
+  	grep -qxF "add_list firewall.@zone[0].network=wan$((mc+1))_6" "$WORK/uci.log22" \
+  		&& { echo "FAIL: maxmodem=$mc leaked wan$((mc+1))_6 into the zone"; exit 1; }
+  	# eth1's own pair must be present at every modem count
+  	grep -qxF "add_list firewall.@zone[0].network=wan6" "$WORK/uci.log22" \
+  		|| { echo "FAIL: eth1's wan6 dropped out at maxmodem=$mc"; exit 1; }
+  done
+  # a value above the UI ceiling must clamp, not generate wan6..wan99
+  rm -f "$WORK/uci.log22b"
+  MAXMODEM_STUB=99 WANZONE_NET_STUB='wan wan6' WANZONE_FWD_STUB=DROP \
+  	UCI_LOG="$WORK/uci.log22b" \
+  	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+  	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+  	MWAN3_STUB_FILE="$WORK/mwan3.model" sh ../install.sh --apply >/dev/null 2>&1
+  grep -qxF "add_list firewall.@zone[0].network=wan5_6" "$WORK/uci.log22b" \
+  	|| { echo "FAIL: maxmodem=99 did not clamp to 5"; exit 1; }
+  # exact whole-line match, and the unambiguous _6 name: a substring match on
+  # 'wan6' would hit eth1's own always-present wan6 and fail unconditionally.
+  grep -qxF 'add_list firewall.@zone[0].network=wan6_6' "$WORK/uci.log22b" \
+  	&& { echo "FAIL: maxmodem=99 was not clamped — generated wan6_6+"; exit 1; }
+  echo "PASS: zone follows maxmodem 1/2/4/5 and clamps 99 -> 5"
+
+  echo
+  echo "== TEST 23: re-running after the rebuild changes nothing (idempotent) =="
+  # Delete-then-rebuild exists so a collapsed zone can be repaired AND a healthy
+  # one stays stable. The original guard (`echo $network | grep wan1`) matched
+  # its OWN output, so it could only ever run once.
+  rm -f "$WORK/uci.log23"
+  MAXMODEM_STUB=4 \
+  	WANZONE_NET_STUB='wan wan6 wan1 wan1_6 wan2 wan2_6 wan3 wan3_6 wan4 wan4_6 wwan2 wwan5' \
+  	WANZONE_FWD_STUB=DROP \
+  	UCI_LOG="$WORK/uci.log23" \
+  	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+  	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+  	MWAN3_STUB_FILE="$WORK/mwan3.model" sh ../install.sh --apply >/dev/null 2>&1
+  if grep -qF 'firewall.@zone[0].network' "$WORK/uci.log23"; then
+  	echo "FAIL: a correct zone was rewritten anyway — not idempotent"
+  	grep -F 'firewall.@zone[0].network' "$WORK/uci.log23" | sed 's/^/    /'
+  	exit 1
+  fi
+  echo "PASS: a healthy zone is left untouched"
+
+  echo
+  echo "== TEST 24: wan forward REJECT -> DROP, and only REJECT =="
+  # 25.12 gold (z8102-custom-config 93-firewall-config) sets forward='DROP' for
+  # the wan zone; stock OpenWrt/ROOter 24.10 ships REJECT. Verified live on the
+  # reference box before this change.
+  rm -f "$WORK/uci.log24"
+  MAXMODEM_STUB=4 WANZONE_NET_STUB='wan wan6' WANZONE_FWD_STUB=REJECT \
+  	UCI_LOG="$WORK/uci.log24" \
+  	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+  	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+  	MWAN3_STUB_FILE="$WORK/mwan3.model" sh ../install.sh --apply >/dev/null 2>&1
+  grep -qxF 'set firewall.@zone[0].forward=DROP' "$WORK/uci.log24" \
+  	|| { echo "FAIL: forward REJECT -> DROP not applied"; exit 1; }
+  rm -f "$WORK/uci.log24b"
+  MAXMODEM_STUB=4 WANZONE_NET_STUB='wan wan6' WANZONE_FWD_STUB=DROP \
+  	UCI_LOG="$WORK/uci.log24b" \
+  	PATH="$X$WORK:$PATH" ROOTUP_ROOT="$WORK/new-root" ROOTUP_TEST=1 \
+  	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
+  	MWAN3_STUB_FILE="$WORK/mwan3.model" sh ../install.sh --apply >/dev/null 2>&1
+  grep -qF 'firewall.@zone[0].forward' "$WORK/uci.log24b" \
+  	&& { echo "FAIL: forward=DROP was rewritten; only REJECT should change"; exit 1; }
+  echo "PASS: REJECT->DROP applied once, DROP left alone"
+
+  echo
+  echo "== ALL OFFLINE TESTS PASSED =="

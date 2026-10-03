@@ -4,9 +4,10 @@
 #
 # Applies four generic fixes to ROOter 24.10 boxes built from the same
 # ./build ecosystem (the routers listed in router2410.json):
-#   1. IPv6 end-to-end  (firewall _6 members + masq6, lan ip6*, wan6 PD,
-#                        odhcpd RA, mwan3 numeric tracking, mwan3 v6
-#                        conntrack-flush removal)
+#   1. IPv6 end-to-end  (wan zone membership REBUILT as discrete entries,
+#                        masq6, wan forward REJECT->DROP for 25.12 parity,
+#                        lan ip6*, wan6 PD, odhcpd RA, mwan3 numeric
+#                        tracking, mwan3 v6 conntrack-flush removal)
 #   2. TTL/HL nft fix   (handlettl.sh broken nft syntax on fw4 builds)
 #   3. Preserve fix     (skip AT writes / hard reset when the modem already
 #                        owns the session; UI toggle for it)
@@ -40,7 +41,7 @@
 #   ROOTUP_SKIP_NFT=1    skip live nft verification
 # ============================================================================
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 ROOT="${ROOTUP_ROOT:-/}"
 TESTMODE="${ROOTUP_TEST:-0}"
 PROCFS="${ROOTUP_PROCFS:-/proc}"

@@ -19,42 +19,8 @@ fix_ipv6() {
 	printf '\n== IPv6 ==\n'
 	need_reload=0
 
-	# --- firewall: add every existing wan<N>_6 to the wan zone, masq6 1 ---
-	if [ -n "$WAN_ZONE" ]; then
-		z="$WAN_ZONE"
-		i=1
-		while [ "$i" -le 5 ]; do
-			iv6="wan${i}_6"
-			proto="$(uciq get network.$iv6.proto)"
-			if [ "$proto" = "dhcpv6" ]; then
-				# uci returns list values space-separated; token-match the member
-				now="$(uciq get firewall.@zone[$z].network)"
-				found=0
-				for t in $now; do [ "$t" = "$iv6" ] && found=1; done
-				if [ "$found" = 1 ]; then
-					debug "firewall already covers $iv6"
-				else
-					note "firewall: adding $iv6 to wan zone"
-					if [ "$MODE" = "apply" ]; then
-						uciq add_list firewall.@zone[$z].network="$iv6"
-						need_reload=1
-					fi
-				fi
-			fi
-			i=$((i+1))
-		done
-		# masq6 (IPv6 NAT) — gold truth, baked into do_zone()
-		mq="$(uciq get firewall.@zone[$z].masq6)"
-		if [ "$mq" != "1" ]; then
-			note "firewall: setting masq6 1 on wan zone"
-			if [ "$MODE" = "apply" ]; then
-				uciq set firewall.@zone[$z].masq6="1"
-				need_reload=1
-			fi
-		fi
-	else
-		debug "no wan zone resolved — firewall part skipped"
-	fi
+	# --- firewall: rebuild the wan zone membership, masq6 1 ---
+	fix_wan_zone
 
 	# --- network: lan ip6 options (config_generate parity) ---
 	if uciq show network.lan >/dev/null 2>&1; then
@@ -127,6 +93,186 @@ fix_ipv6() {
 	# activate_mwan3 announces in both modes and only executes in apply.
 	activate_mwan3
 	ok "IPv6 fix"
+}
+
+# ---------------------------------------------------------------------------
+# Wan zone membership: REBUILD, do not append.
+#
+# The defect this replaces
+# -----------------------
+# ROOter's own first-boot script /usr/lib/rooter/initialize.sh do_zone() does:
+#
+#     config_get network $1 network
+#     newnet=$network
+#     ...  newnet="$newnet wan$COUNTER"  (loop, hardcoded to 5)
+#     uci_set firewall "$config" network "$newnet"
+#
+# uci_set is a bare `uci set` (lib/config/uci.sh:78) with no quoting, and
+# `uci set` does NOT split whitespace on a list option. The result is a
+# SINGLE list element holding a space-separated string:
+#
+#     list network 'wan wan6 wan1 wan2 wan3 wan4 wan5 wwan2 wwan5'
+#
+# fw4 looks up each list element as one network name. There is no network
+# called "wan wan6 wan1 ...", so the element resolves to NOTHING and is
+# dropped. Verified on the reference box: the only wan-zone device in the
+# rendered nft ruleset was usb1, and it was there only because roo_fix had
+# appended a properly-formed `list network 'wan2_6'`. eth1 (the box's own
+# wan/wan6) and usb0 (wan1) were in no zone at all, falling through to
+# `jump handle_reject`.
+#
+# The previous version of this fix APPENDED wan<N>_6 entries, which both
+# inherited the hardcoded 5 and could never repair the collapsed string.
+#
+# Why delete-then-rebuild
+# -----------------------
+# Delete-then-rebuild is idempotent AND self-repairing: a string built by the
+# old code is replaced outright rather than skipped. The original do_zone()
+# guard (`echo $network | grep wan1`) matches its OWN output, so on any box
+# where it has already run it can never run again -- which is precisely why a
+# fresh flash is the only thing that currently clears this. Rebuilding is
+# also order-stable, so re-running this installer produces no diff.
+#
+# Modem count is read from maxmodem.maxmodem.maxmodem rather than hardcoded,
+# matching the pattern already used a few lines away in initialize.sh (which
+# loops `while [ $COUNTER -le $MODCNT ]` to CREATE wan<N>). maxmodem is only
+# READ here: this installer never writes it.
+#
+# The upper clamp is what keeps the CEILING meaningful. initialize.sh keeps a
+# second loop, hardcoded to 5, that deletes stale network.wan<N>/wan<N>_6
+# sections left over from a previously-larger setting; that loop must stay at
+# the true maximum. maxmodem.sh does no validation, so an operator can set
+# anything at all through the LuCI XHR endpoint; clamping here keeps a bogus
+# value from generating wan6..wan99 zone members no hardware backs.
+# ---------------------------------------------------------------------------
+
+# ROOter's "Multiple Modems" ceiling, as offered by the LuCI select in
+# /usr/lib/lua/luci/view/rooter/multimodem.htm (1..5).
+MAXMODEM_CEILING=5
+
+# modem_count: the box's configured maximum modem count, clamped to
+# 1..MAXMODEM_CEILING. Falls back to 2 (ROOter's own non-mwan3 default) on
+# anything missing or non-numeric.
+modem_count() {
+	_mc="$(uciq get maxmodem.maxmodem.maxmodem)"
+	case "$_mc" in
+		''|*[!0-9]*) _mc=2 ;;
+	esac
+	[ "$_mc" -lt 1 ] && _mc=1
+	[ "$_mc" -gt "$MAXMODEM_CEILING" ] && _mc="$MAXMODEM_CEILING"
+	printf '%s' "$_mc"
+}
+
+# The wan zone's network list as discrete tokens.
+#
+# `uci get` on a list returns space-separated values, and word-splitting on
+# whitespace turns BOTH the correct form ('wan wan6' -> two tokens) and the
+# collapsed form ('wan wan6 wan1' -> also two tokens, but the second one is
+# not a network name) back into a token list. So a plain token comparison
+# cannot tell a healthy zone from a broken one -- hence the rebuild.
+wan_zone_tokens() {
+	uciq get "firewall.@zone[$WAN_ZONE].network" 2>/dev/null
+}
+
+# norm: collapse runs of whitespace and trim, so a token-list comparison is
+# insensitive to how uci happens to render it.
+norm() { printf '%s' "$*" | tr -s ' \t\n' ' ' | sed 's/^ *//;s/ *$//'; }
+
+fix_wan_zone() {
+	if [ -z "$WAN_ZONE" ]; then
+		debug "no wan zone resolved — firewall part skipped"
+		return 0
+	fi
+
+	_mc="$(modem_count)"
+
+	# Desired membership, in order:
+	#   wan / wan6            -- the box's own upstream (eth1); always present
+	#   wan<N> / wan<N>_6     -- one pair per configured modem slot, N=1..maxmodem
+	#   wwan2 / wwan5         -- the wifi-hotspot-as-wan interfaces, always present
+	#
+	# This is the 25.12 gold SHAPE (z8102-custom-config 93-firewall-config:
+	#   add_list ...network='wan' / 'wan6' / 'wan1' / 'wan1_6' / 'wan2' / 'wan2_6')
+	# with membership computed instead of listed. The gold hardcodes six
+	# members because the Z8102 topology is a known two-modem box; ROOter
+	# cannot, because the modem count is a runtime setting and sizing itself
+	# to it is the whole purpose of do_zone(). So the structure is matched,
+	# the list is derived.
+	#
+	# wwan2/wwan5 are added UNCONDITIONALLY, matching the stock do_zone() output
+	# on the reference box and matching initialize.sh's own construction. They
+	# are not filtered on the network existing, because on a ROOter box they do.
+	#
+	# Variable names are prefixed because this installer is ONE flat namespace:
+	# `n`, `z` and `i` are already used by 50-fix-ttl.sh, 60-fix-preserve.sh,
+	# 70-main.sh and 20-detect.sh, and there is no `local` in POSIX sh here.
+	WZ_WANT="wan wan6"
+	WZ_I=1
+	while [ "$WZ_I" -le "$_mc" ]; do
+		WZ_WANT="$WZ_WANT wan$WZ_I wan${WZ_I}_6"
+		WZ_I=$((WZ_I+1))
+	done
+	WZ_WANT="$WZ_WANT wwan2 wwan5"
+
+	WZ_HAVE="$(wan_zone_tokens)"
+
+	# Compare as whitespace-collapsed token strings. Order is deterministic on
+	# both sides, so a match means "already correct" and re-running is a no-op.
+	if [ "$(norm "$WZ_HAVE")" = "$(norm "$WZ_WANT")" ]; then
+		debug "wan zone membership already correct ($_mc modem slots)"
+	else
+		note "firewall: rebuilding wan zone network list (maxmodem=$_mc)"
+		note "firewall:   from: $WZ_HAVE"
+		note "firewall:   to:   $WZ_WANT"
+		if [ "$MODE" = "apply" ]; then
+			# delete the whole option -- this is what removes the collapsed
+			# single-element string. add_list then creates it back as discrete
+			# entries, which is what fw4 can actually resolve. uciq already
+			# passes -q, so a missing option stays silent.
+			uciq delete "firewall.@zone[$WAN_ZONE].network" 2>/dev/null
+			for WZ_N in $WZ_WANT; do
+				uciq add_list "firewall.@zone[$WAN_ZONE].network=$WZ_N"
+			done
+			need_reload=1
+		fi
+	fi
+
+	# masq6 (IPv6 NAT) — kept. This is NOT part of the collapsed-string
+	# defect; it is a separate scalar option, so the string bug never
+	# touched it. Present in the 25.12 gold
+	# (z8102-custom-config 93-firewall-config line 60:
+	#   set firewall.@zone[-1].masq6='1')
+	# and in our initialize.sh since commit 713ee9db, which aligned it.
+	z="$WAN_ZONE"
+	mq="$(uciq get firewall.@zone[$z].masq6)"
+	if [ "$mq" != "1" ]; then
+		note "firewall: setting masq6 1 on wan zone"
+		if [ "$MODE" = "apply" ]; then
+			uciq set firewall.@zone[$z].masq6="1"
+			need_reload=1
+		fi
+	fi
+
+	# wan forward policy: REJECT -> DROP.
+	#
+	# Divergence from the 25.12 gold, verified live on the reference box
+	# (wan zone @zone[1] had forward=REJECT while the gold sets DROP).
+	# This is inherited from the stock OpenWrt firewall4 default, not
+	# something ROOter chose, so it is a genuine alignment gap rather than
+	# a bug in ROOter's script.
+	#
+	# Deliberately NOT bundled with the zone-membership rebuild: membership
+	# fixes which interfaces are zoned, this changes what the zone DOES with
+	# them. Separate concerns, so one run should be able to attribute any
+	# behaviour change to one of them.
+	fw="$(uciq get firewall.@zone[$z].forward)"
+	if [ "$fw" = "REJECT" ]; then
+		note "firewall: wan zone forward REJECT -> DROP (25.12 parity)"
+		if [ "$MODE" = "apply" ]; then
+			uciq set firewall.@zone[$z].forward="DROP"
+			need_reload=1
+		fi
+	fi
 }
 
 # mwan3 members of the given family, one name per line.
