@@ -2,7 +2,12 @@
 
 One-shot installer that applies seven validated fixes to an existing
 ROOter 24.10 box **without a reflash**. Targeted at routers built from the
-same build ecosystem (OpenWrt 24.10 / firewall4 / nftables base).
+same build ecosystem (GoldenOrb 24.10.3 AutoBuild Firmware). The main goal
+of this project was to fix problems that prevented Quectel modems in ECM to
+work properly with IPV6 and mwan3. This allows modems that have MBN
+automatic selection turned on or are running a management GUI inside the
+modem (QManager or SimpleAdmin) to work without rooter changing settings
+like APN.
 
 ## How to install
 
