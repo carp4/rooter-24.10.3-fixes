@@ -41,7 +41,7 @@
 #   ROOTUP_SKIP_NFT=1    skip live nft verification
 # ============================================================================
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 ROOT="${ROOTUP_ROOT:-/}"
 TESTMODE="${ROOTUP_TEST:-0}"
 PROCFS="${ROOTUP_PROCFS:-/proc}"
@@ -484,8 +484,8 @@ fix_ipv6() {
 	# --- mwan3: numeric track targets on all members (no hostnames) ---
 	fix_mwan3_numeric
 
-	# --- mwan3: v6 members must not flush conntrack on tracker churn ---
-	fix_mwan3_v6_flush
+	# --- mwan3: no member may flush conntrack on tracker churn (all members) ---
+	fix_mwan3_flush
 
 	if [ "$MODE" = "apply" ] && [ "$need_reload" = 1 ]; then
 		note "committing + reloading network/firewall/odhcpd"
@@ -711,13 +711,19 @@ fix_wan_zone() {
 # Note on `uci show`: values are QUOTED (mwan3.wan1_6.family='ipv6'), so a
 # regex of the form family=ipv6$ matches nothing. Select the section list on
 # `=interface`, which is unquoted, and test family per section with uci get.
+#
+# With no argument (or the literal 'all') every interface section is listed,
+# regardless of family. Callers that only want one family still pass it.
 mwan3_members() {
 	want_family="$1"
 	uciq show mwan3 2>/dev/null \
 		| sed -n "s/^mwan3\.\([^.=]*\)=interface\$/\1/p" \
 		| while read -r sec; do
-			[ "$(uciq get "mwan3.$sec.family" 2>/dev/null)" = "$want_family" ] \
-				&& echo "$sec"
+			if [ -z "$want_family" ] || [ "$want_family" = all ]; then
+				echo "$sec"
+			elif [ "$(uciq get "mwan3.$sec.family" 2>/dev/null)" = "$want_family" ]; then
+				echo "$sec"
+			fi
 		done
 }
 
@@ -759,22 +765,34 @@ fix_mwan3_numeric() {
 	done
 }
 
-# mwan3 v6 members: drop conntrack flushes on the tracker's own
+# mwan3 members: drop conntrack flushes on the tracker's own
 # connected/disconnected events.
 #
 # The stock baseline sets, on every member:
 #     flush_conntrack = connected disconnected ifup ifdown
-# Carriers here rotate the delegated /64 on renew, so the tracker can fail
-# every target during a rotation while the link is perfectly fine. Each such
-# churn fires connected/disconnected, which flushes conntrack and kills every
-# live LAN session. netifd still fires ifup/ifdown on a genuine link
-# transition, so real outages are still covered.
 #
-# IPv4 members keep the stock list deliberately: they are not on rotating
-# carriers, and removing their flush would change behaviour that is not
-# broken. Only family=ipv6 is touched.
-fix_mwan3_v6_flush() {
-	for sec in $(mwan3_members ipv6); do
+# mwan3_flush_conntrack() performs `echo f > nf_conntrack_flush`, which is a
+# GLOBAL kernel flush, not a per-member one -- the interface argument only
+# selects whose list is tested, but on a match the whole conntrack table is
+# wiped for the entire router. So one member's mistaken event costs every
+# OTHER member its live sessions too, and there is no "only the v6 legs are
+# sensitive" nuance to preserve.
+#
+# The two remaining events split cleanly by source of truth:
+#     ifup / ifdown    -> the kernel really changed the link. Trustworthy.
+#     connected /
+#     disconnected     -> mwan3track's ping opinion. Fallible, and routinely
+#                         wrong here: the carrier rotates the delegated /64 on
+#                         renew, so the tracker can fail ALL targets mid-
+#                         rotation while the link is perfectly fine.
+#
+# Hence ONE rule for EVERY member, v4 and v6 alike: keep only the events the
+# member already had among ifup/ifdown. netifd still fires those on a genuine
+# link transition, so real outages are still covered, and not flushing on a
+# real transition only leaves stale NAT that ages out on its own within
+# minutes -- whereas flushing on a false one drops every live session.
+fix_mwan3_flush() {
+	for sec in $(mwan3_members); do
 		cur="$(uciq get "mwan3.$sec.flush_conntrack" 2>/dev/null)"
 		# uci returns list values space-separated; compare as a token set so
 		# ordering differences do not cause a pointless rewrite

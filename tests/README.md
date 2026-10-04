@@ -35,10 +35,10 @@ dry-run/report shape).
 | 6 | mwan3 diag fix | IPv6-aware, gated, attributed; stock file is IPv4-only |
 | 7 | mwan3 diag fix | the reported bug is actually fixed — and stock FAILS the same harness |
 | 8 | `mwan3track` fix | recovers a stale ipv6 source pin; stock has no such logic |
-| 9 | member discovery | members found by name, `rule_v6` excluded, ipv4 untouched |
+| 9 | member discovery | members found by name, `rule_v6` excluded, v4 **and** v6 both fixed |
 | 10 | activation gate | intent reported in `--check`, executed only in apply |
 | 11 | discovery vs hardcoding | member set follows the box, nothing baked in |
-| 12 | v6 flush fix | churn removed; `ifup`/`ifdown` never invented; churn-only ends empty |
+| 12 | uniform flush fix | churn removed on v4 **and** v6; `ifup`/`ifdown` never invented; churn-only ends empty |
 | 13 | hotplug absent | **created**, canonical bytes, mode 755 — the stock-flash case |
 | 14 | hotplug canonical | skipped; re-run is a no-op |
 | 15 | hotplug known-old | both real prior revisions (r10, r9) replaced |

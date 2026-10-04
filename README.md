@@ -38,7 +38,7 @@ Pin a release by swapping `main` for the tag (e.g. `v1.0.1`).
 | 3 | **Already-connected ECM preserve** — when a modem already owns the session, ROOter's connect flow now skips the AT-command takeover + hard reset instead of dropping the link; per-modem `preserve` toggle ("Skip Connection Script for Hostless Modem if Already Connected", default **Yes**) | `create_hostless.sh`, `get_profile.sh`, `profiles.lua` | yes |
 | 4 | **mwan3 IPv6 diagnostics** — LuCI → mwan3 → Diagnostics reported a phantom "Missing fwmark and iif IP rule" and "Routing table not found" for every `wan<N>_6` member, because the upstream `luci-mwan3` helper always used the IPv4-only `ip rule` / `ip route list table N`. Now selects the `ip -6` forms for mwan3 interfaces with `family=ipv6` | `luci-mwan3` | yes |
 | 5 | **mwan3track stale IPv6 source pin** — the tracker pinned one IPv6 source address for the life of the process while the carrier rotated the delegated /64, so every track target then failed with `failed to bind to ip address: Address not available` and the member showed 100% loss on a perfectly healthy link. The patched tracker re-derives its source in place, no restart needed | `mwan3track` | yes |
-| 6 | **mwan3 IPv6 conntrack churn** — stock sets `flush_conntrack` to `connected disconnected ifup ifdown` on every member, and `connected`/`disconnected` fire on tracker churn during a prefix rotation, flushing conntrack and killing every live LAN session. IPv6 members drop to `ifup ifdown` (a real link transition still fires those); IPv4 members are left alone | uci config | no (config apply, idempotent) |
+| 6 | **mwan3 conntrack churn (every member)** — stock sets `flush_conntrack` to `connected disconnected ifup ifdown` on every member, and `connected`/`disconnected` fire on tracker churn during a prefix rotation, flushing conntrack and killing every live LAN session. Every member drops to `ifup ifdown` (a real link transition still fires those). Uniform on purpose: `mwan3_flush_conntrack()` runs `echo f > nf_conntrack_flush`, a **router-global** wipe, so an IPv4 member's churn event destroys every member's sessions exactly as a v6 one does | uci config | no (config apply, idempotent) |
 | 7 | **withdrawal recovery, netifd-unaware** — when the carrier withdraws the last delegated prefix the kernel has no global address left, but netifd still reports the interface up, so nothing ever re-solicits DHCPv6 and the member is dead until a manual interface cycle. An iface hotplug re-cycles the interface when both global v6 addresses disappear | `50-z8102-wan6-mwan3` | yes — **created if absent** |
 
 Fix 4 is a **diagnostic** fix, not a connectivity fix: it corrects what the
@@ -67,13 +67,37 @@ contains **no** mwan3 call, so installing it cannot bounce WAN tracking.
 
 ### What fix 6 does *not* do
 
-Fix 6 removes the `connected`/`disconnected` flush events. It does **not**
-write `ifup ifdown` onto every IPv6 member: a member that had no
-`flush_conntrack` list at all keeps having none, and a member trimmed down to
-the churn events alone ends up with no list. Only the churn events are the
-defect, so only they are removed — the link-transition events a member already
-had are preserved. Forcing a list onto a member would add conntrack flushing
-nobody asked for, which is a behaviour change disguised as a repair.
+Fix 6 removes the `connected`/`disconnected` flush events from every member. It
+does **not** write `ifup ifdown` onto a member that had no `flush_conntrack`
+list at all: such a member keeps having none, and a member trimmed down to the
+churn events alone ends up with no list. Only the churn events are the defect,
+so only they are removed — the link-transition events a member already had are
+preserved. Forcing a list onto a member would add conntrack flushing nobody
+asked for, which is a behaviour change disguised as a repair.
+
+### Why fix 6 applies to every member, not just the IPv6 ones
+
+This used to be scoped to `family=ipv6`, on the reasoning that only the v6 legs
+sit on carriers that rotate the delegated /64. That reasoning was wrong about
+the blast radius, and the stock config shows why it looked right: all 22 members
+ship the identical four-event list, so the v6-only variant quietly left 14 of
+the 22 exposed to precisely the failure it claimed to prevent.
+
+`mwan3_flush_conntrack()` in `mwan3.sh` performs
+
+    echo f > /proc/sys/net/netfilter/nf_conntrack_flush
+
+which is a **router-global** wipe. The `$interface` argument only selects
+*whose list gets tested*; on a match, the entire conntrack table goes — every
+WAN, every LAN session, every TCP flow in teardown. A prefix rotation makes the
+v4 tracker's opinion wrong in exactly the same way it makes the v6 tracker's
+opinion wrong, so both flushes are equally destructive. Hence one rule for every
+member: `ifup` and `ifdown` only.
+
+The cost asymmetry is what settles it. Failing to flush on a *real* transition
+leaves stale NAT that ages out on its own within minutes. Flushing on a *false*
+one drops every live session on the box, immediately. There is no cheap way to
+buy the first without occasionally paying the second.
 
 ### The third IPv6 failure mode
 
@@ -204,6 +228,56 @@ from `git HEAD`. The tree files are frequently uncommitted working state, so
 be vacuous.
 
 ## Changelog
+
+### v1.4.0
+
+- Fix 6 (conntrack churn) is now applied to **every** mwan3 member, v4 as well as
+  v6. It was previously scoped to `family=ipv6`, on the reasoning that only the
+  v6 legs sit on carriers that rotate the delegated /64.
+- That reasoning was wrong about the blast radius. `mwan3_flush_conntrack()` in
+  `mwan3.sh` runs `echo f > /proc/sys/net/netfilter/nf_conntrack_flush`, which is
+  a **router-global** wipe: the interface argument only selects whose list gets
+  tested, and on a match the whole conntrack table goes. One member's mistaken
+  churn event therefore costs every *other* member its live sessions too.
+- The stock config is what made the old scope look defensible: all 22 members
+  ship the identical four-event list, so the v6-only variant quietly left 14 of
+  the 22 exposed to the exact failure it claimed to prevent.
+- The deliberate **"never ADD a flush to a member that had none"** rule is
+  unchanged and still tested: a member with no `flush_conntrack` keeps having
+  none, and a member trimmed down to the churn events alone ends with no list.
+- `mwan3_members()` now takes an optional family — with no argument, or `all`, it
+  lists every interface section; callers wanting one family still pass it.
+  `fix_mwan3_v6_flush` is renamed `fix_mwan3_flush`.
+- Tests were updated to pin the new behaviour rather than the old. Test 9 and
+  test 12 now assert v4 members **are** reduced (test 12 gained a churn-only v4
+  case), and test 18 asserts all 22/22 stock members converge instead of 8 with
+  14 left alone. Test 10's "clean" fixture also had to change: its v4 member
+  carried the four-event list, which *is* a real change under the uniform rule,
+  so the fixture was no longer clean and its no-op assertion started failing for
+  the wrong reason. 27 assertions pass.
+
+### v1.3.0
+
+- ROOter's first-boot `initialize.sh do_zone()` wrote the wan zone with a bare
+  `uci set` and a space-joined string. `uci set` does not split whitespace on a
+  list option, so the zone ended up holding ONE element whose value was the whole
+  string (`list network 'wan wan6 wan1 ...'`). fw4 resolves each element as a
+  single network name, so it matched nothing and was dropped. Verified on
+  hardware: the only wan-zone device in the rendered nft ruleset was `usb1`, and
+  only because an earlier fix appended a well-formed `list network 'wan2_6'` —
+  eth1 (wan/wan6) and usb0 (wan1) were in no zone at all and fell through to
+  `jump handle_reject`.
+- Replaced with delete-then-rebuild: discrete `add_list` entries, the one shape
+  fw4 actually resolves; membership derived from `maxmodem.maxmodem.maxmodem`
+  (clamped 1..5) instead of hardcoded; and idempotent, where the original guard
+  (`grep wan1` against its own output) could never fire a second time.
+- Wan zone forward policy aligned REJECT -> DROP, matching the 25.12 reference
+  build (the stock firewall4 default ROOter inherits is REJECT). Applied
+  independently of membership, so a behaviour change stays attributable.
+- Tests 21-24 cover the rebuild, the dynamic sizing (1/2/4/5, and 99 clamped to
+  5), idempotency, and the forward change. The uci stub now records mutating
+  calls, so tests assert on what the installer did rather than on its output
+  text. All four were verified to fail against deliberately mutated code.
 
 ### v1.2.1
 

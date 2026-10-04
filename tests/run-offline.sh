@@ -665,25 +665,22 @@ out="$(run_install "$WORK/new-root" --check 2>&1)"
 if printf '%s\n' "$out" | grep -q "mwan3 interface 'rule_v6'"; then
 	echo "FAIL: rule_v6 (a policy rule) was treated as an interface"; printf '%s\n' "$out"; exit 1
 fi
-# the ipv6 members that DO need the flush fix must be reported
-for want in wan1_6 wan2_6; do
+# every interface member still carrying churn must be reported -- v4 and v6
+# alike, because the rule is uniform: mwan3_flush_conntrack() is a GLOBAL
+# flush, so an ipv4 member's churn event is just as destructive as a v6 one
+for want in wan1 wan1_6 wan2 wan2_6; do
 	printf '%s\n' "$out" | grep -q "mwan3 interface '$want': flush_conntrack" \
-		|| { echo "FAIL: $want not reported by the v6 flush fix"; printf '%s\n' "$out"; exit 1; }
+		|| { echo "FAIL: $want not reported by the flush fix"; printf '%s\n' "$out"; exit 1; }
 done
 # wan6 is already correct in the model: it must NOT be rewritten (idempotency)
 printf '%s\n' "$out" | grep -q "mwan3 interface 'wan6': flush_conntrack" \
 	&& { echo "FAIL: already-correct wan6 would be rewritten"; printf '%s\n' "$out"; exit 1; }
-# ipv4 members must be left alone entirely
-for v4 in wan1 wan2; do
-	printf '%s\n' "$out" | grep -q "mwan3 interface '$v4': flush_conntrack" \
-		&& { echo "FAIL: ipv4 member $v4 was touched by the v6 flush fix"; exit 1; }
-done
 # hostname track_ips must be reported (proves named enumeration works at all)
 for hn in wan1 wan1_6; do
 	printf '%s\n' "$out" | grep -q "mwan3 interface '$hn': replace hostname track_ip" \
 		|| { echo "FAIL: $hn hostname track_ip not detected — enumeration is broken"; printf '%s\n' "$out"; exit 1; }
 done
-echo "PASS: members discovered by name; rule_v6 excluded; ipv4 untouched; idempotent"
+echo "PASS: members discovered by name; rule_v6 excluded; v4 and v6 both fixed; idempotent"
 
 echo
 echo "== TEST 10: mwan3 activation is gated on an actual change =="
@@ -699,8 +696,15 @@ echo "== TEST 10: mwan3 activation is gated on an actual change =="
 newout="$(run_install "$WORK/new-root" --check 2>&1)"
 
 # Build a model where nothing needs changing, and require no restart intent.
+#
+# EVERY member here must already be 'ifup ifdown', v4 included. That used to
+# only matter for the v6 legs: under the old v6-only rule a v4 member carrying
+# 'connected disconnected ifup ifdown' counted as correct, so this fixture
+# stayed "clean". The rule is now uniform, so such a member is a real change
+# and this fixture would correctly demand a restart -- making the assertion
+# below fail for the right reason at the wrong moment. Clean means clean.
 cat > "$WORK/mwan3.clean" <<'CLEAN'
-wan1	interface	ipv4	1.1.1.1 8.8.8.8 9.9.9.9	connected disconnected ifup ifdown
+wan1	interface	ipv4	1.1.1.1 8.8.8.8 9.9.9.9	ifup ifdown
 wan1_6	interface	ipv6	2606:4700::1001 2001:4860:4860::8888 2620:fe::9	ifup ifdown
 CLEAN
 run_with_model() { # model-file mode debug -> output
@@ -766,16 +770,21 @@ fi
 echo "PASS: discovery follows the box's member set, nothing hardcoded"
 
 echo
-echo "== TEST 12: the v6 flush fix removes churn, it never adds flushing =="
+echo "== TEST 12: the flush fix removes churn on EVERY member, it never adds flushing =="
 # The defect is connected/disconnected firing on tracker churn; removing them
-# is the fix. Forcing 'ifup ifdown' onto a member that never had a
-# flush_conntrack list would ADD conntrack flushing nobody asked for -- a
-# behaviour change disguised as a repair. Same trap for a member trimmed down
-# to the churn events alone: the honest result is no list, not the two
-# link-transition events invented back.
+# is the fix. The fix is UNIFORM: mwan3_flush_conntrack() does a global
+# `echo f > nf_conntrack_flush`, so one member's mistaken event costs every
+# other member its sessions too. IPv4 members are therefore included -- that
+# is the behaviour change this test now pins.
+# Forcing 'ifup ifdown' onto a member that never had a flush_conntrack list
+# would ADD conntrack flushing nobody asked for -- a behaviour change
+# disguised as a repair. Same trap for a member trimmed down to the churn
+# events alone: the honest result is no list, not the two link-transition
+# events invented back.
 cat > "$WORK/mwan3.edge" <<'EDGE'
 wan1	interface	ipv4	1.1.1.1	connected disconnected ifup ifdown
 wan1_6	interface	ipv6	2606:4700::1001	connected disconnected ifup ifdown
+wan2	interface	ipv4	1.1.1.1	connected
 wan2_6	interface	ipv6	2606:4700::1001
 wan3_6	interface	ipv6	2606:4700::1001	connected disconnected
 EDGE
@@ -784,9 +793,15 @@ edgeout="$(X=""; [ "$NOB64" = 1 ] && X="$WORK/nob64:"; \
 	ROOTUP_SKIP_NFT=1 ROOTUP_PROCFS="/proc" \
 	MWAN3_STUB_FILE="$WORK/mwan3.edge" sh ../install.sh --check 2>&1)"
 
-# stock shape: churn removed, the link transitions it already had are kept
+# stock shape, v6: churn removed, the link transitions it already had are kept
 printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan1_6': flush_conntrack .*-> 'ifup ifdown'" \
 	|| { echo "FAIL: stock-shaped wan1_6 not reduced to 'ifup ifdown'"; printf '%s\n' "$edgeout"; exit 1; }
+# stock shape, v4: SAME rule applies -- this is the uniformity being pinned
+printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan1': flush_conntrack .*-> 'ifup ifdown'" \
+	|| { echo "FAIL: stock-shaped wan1 (ipv4) not reduced to 'ifup ifdown' -- the rule is not uniform"; printf '%s\n' "$edgeout"; exit 1; }
+# v4 member carrying ONLY churn: nothing invented to replace it
+printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan2': flush_conntrack .*-> '<none>'" \
+	|| { echo "FAIL: churn-only wan2 (ipv4) should end with no list, not 'ifup ifdown'"; printf '%s\n' "$edgeout"; exit 1; }
 # churn only: churn removed, nothing invented to replace it
 printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan3_6': flush_conntrack .*-> '<none>'" \
 	|| { echo "FAIL: churn-only wan3_6 should end with no list, not 'ifup ifdown'"; printf '%s\n' "$edgeout"; exit 1; }
@@ -795,7 +810,7 @@ if printf '%s\n' "$edgeout" | grep -q "mwan3 interface 'wan2_6'"; then
 	echo "FAIL: wan2_6 (no flush_conntrack) was modified -- flushing was invented"
 	printf '%s\n' "$edgeout"; exit 1
 fi
-echo "PASS: churn removed; ifup/ifdown preserved and never added; churn-only ends empty"
+echo "PASS: churn removed on v4 AND v6; ifup/ifdown preserved and never added; churn-only ends empty"
 
 echo
 echo "== TEST 13: withdrawal hotplug is CREATED when the box has none =="
@@ -957,14 +972,17 @@ awk -F'\t' '$2=="interface" && $3=="ipv6"{print $1}' "$WORK/mwan3.real" | while 
 done || bad6=1
 [ "$bad6" = 0 ] || { printf '%s\n' "$out18"; exit 1; }
 
-# every ipv4 member is left exactly as stock. The v4 churn flush is upstream
-# behaviour and out of scope: removing it is a separate decision, not a repair.
+# Every ipv4 member converges too. The rule is uniform: mwan3_flush_conntrack()
+# performs a GLOBAL `echo f > nf_conntrack_flush`, so an ipv4 member's churn
+# event destroys every member's sessions exactly as a v6 one does -- there is
+# no "v4 is fine" nuance left to preserve. Note the stock fixture carries the
+# IDENTICAL four-event list on all 22 members, which is why the old v6-only
+# rule looked defensible: it silently skipped 14 of the 22 members that were
+# exposed to the very same blast.
 bad4=0
 awk -F'\t' '$2=="interface" && $3=="ipv4"{print $1}' "$WORK/mwan3.real" | while read -r m; do
-	if printf '%s\n' "$out18" | grep -q "mwan3 interface '$m': flush_conntrack"; then
-		echo "FAIL: ipv4 member '$m' had its flush_conntrack touched — v4 churn is out of scope"
-		exit 1
-	fi
+	printf '%s\n' "$out18" | grep -q "mwan3 interface '$m': flush_conntrack 'connected disconnected ifup ifdown' -> 'ifup ifdown'" \
+		|| { echo "FAIL: ipv4 member '$m' did not converge to 'ifup ifdown' -- the rule is not uniform"; exit 1; }
 done || bad4=1
 [ "$bad4" = 0 ] || { printf '%s\n' "$out18"; exit 1; }
 
@@ -975,7 +993,7 @@ for m in wan1_6 wan5_6; do
 done
 printf '%s\n' "$out18" | grep -q "mwan3 interface 'wan1': replace hostname track_ip with 1.1.1.1 8.8.8.8 9.9.9.9" \
 	|| { echo "FAIL: ipv4 wan1 kept hostname track_ip targets"; exit 1; }
-echo "PASS: 8/8 ipv6 -> 'ifup ifdown', 14/14 ipv4 untouched, hostnames -> numerics"
+echo "PASS: 22/22 members (8 ipv6 + 14 ipv4) -> 'ifup ifdown', hostnames -> numerics"
 
 echo
 echo "== TEST 20: NO payload is report-only against the real stock image =="
